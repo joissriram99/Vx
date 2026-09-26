@@ -222,6 +222,44 @@ impl<'a> Parser<'a> {
                     span: Span::default(),
                 }))
             }
+            TokenType::While => {
+                self.advance();
+                let cond = self.parse_expr()?;
+                let mut invariants = Vec::new();
+                while self.match_token(&TokenType::Invariant) {
+                    invariants.push(self.parse_expr()?);
+                }
+                self.consume(&TokenType::LeftBrace, "Expected '{' after while condition")?;
+                let mut while_body = Vec::new();
+                while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+                    self.parse_statement_into(&mut while_body)?;
+                }
+                self.consume(&TokenType::RightBrace, "Expected '}'")?;
+
+                let else_block = Some(vec![Statement::Break(BreakStmt {
+                    span: Span::default(),
+                })]);
+
+                let if_expr = Expr::If(IfExpr {
+                    is_comptime: false,
+                    cond: Box::new(cond),
+                    then_block: while_body,
+                    else_block,
+                    span: Span::default(),
+                });
+
+                let body = vec![Statement::ExprStmt(ExprStmtStmt {
+                    expr: if_expr,
+                    has_semi: false,
+                    span: Span::default(),
+                })];
+
+                Ok(Statement::Loop(LoopStmt {
+                    invariants,
+                    body,
+                    span: Span::default(),
+                }))
+            }
             TokenType::Break => {
                 self.advance();
                 self.consume(&TokenType::Semicolon, "Expected ';'")?;

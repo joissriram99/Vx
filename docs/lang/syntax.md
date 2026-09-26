@@ -297,8 +297,13 @@ body must guarantee, and what the compiler reads off it rather than trusting, is
 
 ## 6. Control Flow
 
-Standard Rust-like control flow is supported: `if`, `else`, `match`, `for`, `loop`, `break`, `continue`.
+Standard Rust-like control flow is supported: `if`, `else`, `match`, `for`, `while`, `loop`, `break`, `continue`.
 Loops can be annotated for spatial unrolling.
+
+`while cond { body }` checks `cond`, a `bool`, before every pass, including the first, and takes
+`invariant` clauses after the condition as `loop` and `for` do. The parser turns it into
+`loop { if cond { body } else { break } }`, as rustc does, so `continue` goes back to the
+condition check. Because of that, a type error in the condition is reported against an `if`.
 
 > [!WARNING]
 > **Experimental / Unimplemented Feature**

@@ -1,0 +1,109 @@
+//===- while_nested.vx - Vx Compiler ------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `break` and `continue` act on the innermost loop only, whether that loop is a
+// `while` inside a `while`, a `while` inside a `loop`, or a `loop` inside a
+// `while`. A `while false` nested in a live loop never runs its body.
+
+fn main() -> i32 {
+  // The inner `break` stops the inner loop; the outer one runs all 3 passes.
+  // Inner passes per outer pass: 2 (it breaks when j reaches 2). 3 * 2 = 6.
+  let mut outer : i32 = 0;
+  let mut inner_total : i32 = 0;
+  while outer < 3 {
+    outer = outer + 1;
+    let mut j : i32 = 0;
+    while j < 10 {
+      j = j + 1;
+      inner_total = inner_total + 1;
+      if j == 2 {
+        break;
+      }
+    }
+  }
+  print!("outer=");
+  print!(outer);
+  print!(",inner_total=");
+  print!(inner_total);
+  print!(";");
+
+  // The inner `continue` skips only the rest of the inner body.
+  // Each outer pass adds 1 + 3 = 4 (skipping 2). 2 passes = 8.
+  let mut p : i32 = 0;
+  let mut skipped_sum : i32 = 0;
+  while p < 2 {
+    p = p + 1;
+    let mut q : i32 = 0;
+    while q < 3 {
+      q = q + 1;
+      if q == 2 {
+        continue;
+      }
+      skipped_sum = skipped_sum + q;
+    }
+  }
+  print!("skipped_sum=");
+  print!(skipped_sum);
+  print!(";");
+
+  // A `while false` inside a live loop never touches `y`.
+  let mut y : i32 = 42;
+  let mut z : i32 = 42;
+  while z < 50 {
+    z = z + 1;
+    while false {
+      y = z;
+    }
+  }
+  print!("y=");
+  print!(y);
+  print!(",z=");
+  print!(z);
+  print!(";");
+
+  // A `while` inside a `loop`: the inner `break` must not leave the `loop`.
+  let mut rounds : i32 = 0;
+  let mut w : i32 = 0;
+  loop {
+    rounds = rounds + 1;
+    while true {
+      w = w + 1;
+      break;
+    }
+    if rounds == 4 {
+      break;
+    }
+  }
+  print!("rounds=");
+  print!(rounds);
+  print!(",w=");
+  print!(w);
+  print!(";");
+
+  // A `loop` inside a `while`: the inner `break` must not leave the `while`.
+  let mut m : i32 = 0;
+  let mut inner_loops : i32 = 0;
+  while m < 5 {
+    m = m + 1;
+    loop {
+      inner_loops = inner_loops + 1;
+      break;
+    }
+  }
+  print!("m=");
+  print!(m);
+  print!(",inner_loops=");
+  print!(inner_loops);
+  print!(";");
+  return 0;
+}
+
+// EXPECT: outer=3,inner_total=6;
+// EXPECT: skipped_sum=8;
+// EXPECT: y=42,z=50;
+// EXPECT: rounds=4,w=4;
+// EXPECT: m=5,inner_loops=5;

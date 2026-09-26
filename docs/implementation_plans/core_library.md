@@ -215,7 +215,7 @@ Track B can be completed; the rest are tagged with the phase that needs them.
 | A17 | **Slices `&[T]` / `&mut [T]` as fat references.** | `core::slice` is a quarter of Rust's `core`. Phase 2 ships `Slice<T>` / `SliceMut<T>` structs over `(ptr, len)` with a `get`/`set` API; `&[T]` sugar and `s[i]` indexing come with A11 and A17. | `Vec::as_slice` returns `&T`. | L | P3 |
 | A18 | **Const generics on methods.** | `core::array`: `[T; N]::map`, `from_fn`, `IntoIter`. | `const_generics_methods.vx` is `XFAIL`. | M | P3 |
 | A19 | **`Drop`.** | Not for `core` itself (its owning types are `Cell` and `ManuallyDrop`, which are trivial), but `mem::drop`, `mem::forget`, `ManuallyDrop` and `MaybeUninit` only mean something once it exists, and every `alloc` type needs it. Vx#495 is the decision. | Reserved bit, nothing set. | L | P3 / alloc |
-| A20 | **`pub` visibility** (Vx#489) and **`while`** (Vx#506), **`if let`**, **`?`**. | Quality of life for writing `core`; none is required for its API. `?` desugars to a `match` on `Result`; `if let` to a two-arm `match`. | None. | S each | any |
+| A20 | **`pub` visibility** (Vx#489) and **`while`** (Vx#506), **`if let`**, **`?`**. | Quality of life for writing `core`; none is required for its API. `?` desugars to a `match` on `Result`; `if let` to a two-arm `match`. | `while` landed in Vx#506, parsed as `loop { if cond { body } else { break } }`. The others: none. | S each | any |
 
 Explicitly **not** required: `dyn Trait` (Rust's `core` uses it only for `fmt::Arguments` and
 `Any`; the Vx `fmt` design in §5 avoids it), attributes (`#[derive]` is replaced by item macros

@@ -1,0 +1,58 @@
+//===- while_basic.vx - Vx Compiler -------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A `while` whose condition is false at the start never runs its body, one that
+// is true runs until it turns false (counting up and counting down), and the
+// condition is checked again before every iteration: three passes plus the
+// final failing check print four marks.
+
+fn below_three(i : i32) -> bool {
+  print!("c");
+  return i < 3;
+}
+
+fn main() -> i32 {
+  let mut zero : i32 = 0;
+  while zero > 100 {
+    zero = zero + 1;
+  }
+  print!("zero=");
+  print!(zero);
+  print!(";");
+
+  let mut up : i32 = 0;
+  while up < 5 {
+    up = up + 1;
+  }
+  print!("up=");
+  print!(up);
+  print!(";");
+
+  let mut down : i32 = 7;
+  let mut steps : i32 = 0;
+  while down > 0 {
+    down = down - 1;
+    steps = steps + 1;
+  }
+  print!("down=");
+  print!(down);
+  print!(",steps=");
+  print!(steps);
+  print!(";");
+
+  let mut i : i32 = 0;
+  while below_three(i) {
+    i = i + 1;
+  }
+  print!(";checks_done;");
+  return 0;
+}
+
+// EXPECT: zero=0;
+// EXPECT: up=5;
+// EXPECT: down=0,steps=7;
+// EXPECT: cccc;checks_done;

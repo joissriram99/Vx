@@ -24,6 +24,7 @@ pub enum TokenTypeBase<S, C> {
     If,
     Else,
     Loop,
+    While,
     Break,
     Continue,
     Return,
@@ -137,6 +138,7 @@ impl<S: std::fmt::Display, C: std::fmt::Display> std::fmt::Display for TokenType
             TokenTypeBase::If => write!(f, "if"),
             TokenTypeBase::Else => write!(f, "else"),
             TokenTypeBase::Loop => write!(f, "loop"),
+            TokenTypeBase::While => write!(f, "while"),
             TokenTypeBase::Break => write!(f, "break"),
             TokenTypeBase::Continue => write!(f, "continue"),
             TokenTypeBase::Return => write!(f, "return"),
@@ -259,6 +261,7 @@ static KEYWORDS: Lazy<
     m.insert("if", TokenTypeBase::If);
     m.insert("else", TokenTypeBase::Else);
     m.insert("loop", TokenTypeBase::Loop);
+    m.insert("while", TokenTypeBase::While);
     m.insert("break", TokenTypeBase::Break);
     m.insert("continue", TokenTypeBase::Continue);
     m.insert("return", TokenTypeBase::Return);
@@ -794,6 +797,7 @@ impl<'a> Token<'a> {
             TokenTypeBase::If => TokenTypeBase::If,
             TokenTypeBase::Else => TokenTypeBase::Else,
             TokenTypeBase::Loop => TokenTypeBase::Loop,
+            TokenTypeBase::While => TokenTypeBase::While,
             TokenTypeBase::Break => TokenTypeBase::Break,
             TokenTypeBase::Continue => TokenTypeBase::Continue,
             TokenTypeBase::Return => TokenTypeBase::Return,
@@ -907,6 +911,7 @@ impl OwnedToken {
             TokenTypeBase::If => TokenTypeBase::If,
             TokenTypeBase::Else => TokenTypeBase::Else,
             TokenTypeBase::Loop => TokenTypeBase::Loop,
+            TokenTypeBase::While => TokenTypeBase::While,
             TokenTypeBase::Break => TokenTypeBase::Break,
             TokenTypeBase::Continue => TokenTypeBase::Continue,
             TokenTypeBase::Return => TokenTypeBase::Return,

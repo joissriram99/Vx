@@ -1,0 +1,63 @@
+//===- while_return.vx - Vx Compiler ------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `return` inside a `while` leaves the whole function, even from a nested
+// loop, and a `while` placed after a `return` still compiles.
+
+// Returns the first multiple of `step` that is above 20.
+fn first_above_twenty(step : i32) -> i32 {
+  let mut x : i32 = 0;
+  while x < 1000 {
+    x = x + step;
+    if x > 20 {
+      return x;
+    }
+  }
+  return -1;
+}
+
+// Returns from two loops deep; the outer loop must not keep going. The first
+// pair whose product is 12 is a = 2, b = 6, reported as 206.
+fn find_pair() -> i32 {
+  let mut a : i32 = 0;
+  while a < 10 {
+    a = a + 1;
+    let mut b : i32 = 0;
+    while b < 10 {
+      b = b + 1;
+      if a * b == 12 {
+        return a * 100 + b;
+      }
+    }
+  }
+  return -1;
+}
+
+// Nothing after the `return` runs, but it must still be accepted.
+fn unreachable_loop() -> i32 {
+  return 7;
+  while true {
+    let dead : i32 = 0;
+  }
+}
+
+fn main() -> i32 {
+  print!("above=");
+  print!(first_above_twenty(6));
+  print!(";");
+  print!("pair=");
+  print!(find_pair());
+  print!(";");
+  print!("unreachable=");
+  print!(unreachable_loop());
+  print!(";");
+  return 0;
+}
+
+// EXPECT: above=24;
+// EXPECT: pair=206;
+// EXPECT: unreachable=7;

@@ -1,0 +1,36 @@
+//===- while_inv_fail.vx - Vx Compiler ----------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A `while` invariant is proven on entry: one the `requires` clause does not
+// establish is rejected, and the one beside it that it does establish is not.
+// RUN: not vxc %s 2>&1 | FileCheck %s
+// CHECK: Loop invariant cannot be proven on entry
+// CHECK: 1 error(s) emitted
+
+fn entry_fails(N : i32) -> i32
+requires N > 5 && N < 15 ensures return > 5
+{
+  let mut i : i32 = 0;
+  while i < 5 invariant(N > 10) {
+    i = i + 1;
+  }
+  return N;
+}
+
+fn entry_holds(N : i32) -> i32
+requires N > 5 && N < 15 ensures return > 5
+{
+  let mut i : i32 = 0;
+  while i < 5 invariant(N > 5) {
+    i = i + 1;
+  }
+  return N;
+}
+
+fn main() -> i32 {
+  return 0;
+}

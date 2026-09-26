@@ -103,6 +103,7 @@ statement ::=
     | "assert" "(" expr ( "," string_literal )? ")" ";"
     | "return" expr ";"
     | "loop" ( "invariant" expr )* "{" statement* "}"
+    | "while" expr ( "invariant" expr )* "{" statement* "}"
     | "break" ";"
     | "continue" ";"
     | "for" identifier "in" expr ( "invariant" expr )* "{" statement* "}"

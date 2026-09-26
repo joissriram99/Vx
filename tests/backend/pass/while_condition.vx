@@ -1,0 +1,64 @@
+//===- while_condition.vx - Vx Compiler ---------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A `while` condition built from `&&` and `||` short-circuits: the right side
+// only runs when the left side does not already decide the answer. Each helper
+// prints a letter, so the output records exactly which checks ran.
+//
+// The legacy AST codegen evaluates both sides of `&&` and `||` before combining
+// them, so there it prints `LR` for the first line below.
+//
+// REQUIRES: flat-codegen
+
+fn left(v : bool) -> bool {
+  print!("L");
+  return v;
+}
+
+fn right(v : bool) -> bool {
+  print!("R");
+  return v;
+}
+
+fn main() -> i32 {
+  // `false && _`: the right side never runs and neither does the body.
+  let mut ran : i32 = 0;
+  while left(false) && right(true) {
+    ran = ran + 1;
+  }
+  print!(",and_ran=");
+  print!(ran);
+  print!(";");
+
+  // `true || _`: the right side never runs. Two passes, then the left side
+  // turns false and the right side decides.
+  let mut i : i32 = 0;
+  while left(i < 2) || right(false) {
+    i = i + 1;
+  }
+  print!(",or_i=");
+  print!(i);
+  print!(";");
+
+  // A condition over two variables, both changed in the body.
+  let mut a : i32 = 0;
+  let mut b : i32 = 10;
+  while a < b {
+    a = a + 1;
+    b = b - 1;
+  }
+  print!("a=");
+  print!(a);
+  print!(",b=");
+  print!(b);
+  print!(";");
+  return 0;
+}
+
+// EXPECT: L,and_ran=0;
+// EXPECT: LLLR,or_i=2;
+// EXPECT: a=5,b=5;

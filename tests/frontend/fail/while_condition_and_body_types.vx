@@ -1,0 +1,34 @@
+//===- while_condition_and_body_types.vx - Vx Compiler ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A `while` condition must be a `bool`, and its body must not end in a value.
+// `while` is checked as the `loop { if cond { body } else { break } }` it
+// becomes, so both messages name an `if`.
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn int_condition() -> i32 {
+  let x : i32 = 5;
+  while x {
+    return 1;
+  }
+  return 0;
+}
+// CHECK: Condition in if expression must be of type bool
+
+fn body_has_a_value() -> i32 {
+  let mut n : i32 = 0;
+  while n < 1 {
+    n = n + 1;
+    true
+  }
+  return 0;
+}
+// CHECK: Error[E3007]{{.*}}If expression branches have incompatible types
+
+fn main() -> i32 {
+  return 0;
+}

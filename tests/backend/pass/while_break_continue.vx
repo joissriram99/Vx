@@ -1,0 +1,73 @@
+//===- while_break_continue.vx - Vx Compiler ----------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `break` leaves a `while` before its condition turns false, and `continue`
+// jumps back to the condition check: it skips the rest of the body but never
+// skips the check, so a loop that ends every pass with `continue` still stops.
+
+fn main() -> i32 {
+  // `break` wins over a condition that is still true.
+  let mut i : i32 = 90;
+  while i < 100 {
+    i = i + 1;
+    if i == 95 {
+      break;
+    }
+  }
+  print!("break_at=");
+  print!(i);
+  print!(";");
+
+  // `continue` skips the even numbers: 1 + 3 + 5 + 7 + 9 = 25.
+  let mut n : i32 = 0;
+  let mut odd_sum : i32 = 0;
+  while n < 10 {
+    n = n + 1;
+    if n % 2 == 0 {
+      continue;
+    }
+    odd_sum = odd_sum + n;
+  }
+  print!("odd_sum=");
+  print!(odd_sum);
+  print!(";");
+
+  // Every pass ends in `continue`; the loop must still see the condition fail.
+  let mut k : i32 = 3;
+  let mut passes : i32 = 0;
+  while k > 0 {
+    k = k - 1;
+    passes = passes + 1;
+    continue;
+  }
+  print!("passes=");
+  print!(passes);
+  print!(";");
+
+  // Both in one loop: skip 3, stop after 6. 1 + 2 + 4 + 5 + 6 = 18.
+  let mut j : i32 = 0;
+  let mut mixed : i32 = 0;
+  while j < 100 {
+    j = j + 1;
+    if j == 3 {
+      continue;
+    }
+    mixed = mixed + j;
+    if j == 6 {
+      break;
+    }
+  }
+  print!("mixed=");
+  print!(mixed);
+  print!(";");
+  return 0;
+}
+
+// EXPECT: break_at=95;
+// EXPECT: odd_sum=25;
+// EXPECT: passes=3;
+// EXPECT: mixed=18;
