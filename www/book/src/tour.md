@@ -50,14 +50,19 @@ for i in 0..n {
     // ...
 }
 
+while i < n {
+    // until the condition is false
+    i = i + 1;
+}
+
 loop {
     // forever, until you break
     if done { break; }
 }
 ```
 
-**There is no `while`.** It is not a keyword, and writing one is a parse error. The two loops are
-`for` over a range and bare `loop` with an explicit `break`.
+The three loops are `for` over a range, `while` with a condition checked before every turn, and
+bare `loop` with an explicit `break`.
 
 `0..n` is a half-open range: it includes `0` and excludes `n`.
 

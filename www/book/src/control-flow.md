@@ -1,6 +1,6 @@
 # Control flow
 
-Vx has four ways to branch or repeat: `if`, `loop`, `for`, and `match`.
+Vx has five ways to branch or repeat: `if`, `loop`, `while`, `for`, and `match`.
 
 ## if and else
 
@@ -70,29 +70,6 @@ fn main() -> i32 {
 }
 ```
 
-### There is no while loop
-
-`while` is not a keyword in Vx. Writing `while i < n { ... }` does not produce a "no such loop"
-message — `while` and `i` both lex as ordinary identifiers, and you get a confusing parse error
-about a missing `;`.
-
-Write the same thing with `loop` and a guard:
-
-```rust
-fn main() -> i32 {
-    let mut i : i32 = 0;
-    loop {
-        if i >= 4 {
-            break;
-        }
-        i = i + 1;
-    }
-    return i - 4;
-}
-```
-
-Whether `while` should exist is [Vx#506](https://github.com/vx-lang/Vx/issues/506).
-
 ### Loop invariants
 
 A `loop` can carry an `invariant`: a condition that must hold on every turn. The prover checks it.
@@ -113,6 +90,63 @@ fn main() -> i32 {
 The parentheses around the condition are **required** here, unlike `requires` and `ensures` on a
 function, which take theirs optionally. That inconsistency is not deliberate — it is
 [Vx#501](https://github.com/vx-lang/Vx/issues/501).
+
+## while
+
+`while` checks its condition before every turn, including the first, and stops as soon as the
+condition is false. If the condition is false to begin with, the body never runs.
+
+```rust
+fn main() -> i32 {
+    let mut i : i32 = 0;
+    while i < 4 {
+        i = i + 1;
+    }
+    return i - 4;
+}
+```
+
+`break` and `continue` work as they do in `loop`. `continue` goes back to the condition check, so
+the condition is never skipped:
+
+```rust
+fn main() -> i32 {
+    let mut i : i32 = 0;
+    let mut odd : i32 = 0;
+    while i < 6 {
+        i = i + 1;
+        if i % 2 == 0 {
+            continue;
+        }
+        odd = odd + 1;
+    }
+    return odd - 3;
+}
+```
+
+A `while` is shorthand for `loop { if cond { body } else { break } }`, and the compiler treats it as
+exactly that. So a condition that is not a `bool` is reported as an error in an `if`.
+
+A `while` can carry `invariant` clauses after its condition, as `loop` and `for` can:
+
+```rust
+fn count_to(n : i32) -> i32
+    requires n > 0
+{
+    let mut i : i32 = 0;
+    while i < n invariant(n > 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn main() -> i32 {
+    return count_to(3) - 3;
+}
+```
+
+There is no `while let` yet, because there is no `if let`. Write `while let Some(x) = next()` as a
+`loop` with a `match` that breaks on `None`.
 
 ## for
 

@@ -1,0 +1,40 @@
+//===- while_body_calls.vx - Vx Compiler --------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A `while` body may hold calls that return a value, written as statements with
+// `;`. The value is dropped, so it does not clash with the `break` branch of the
+// `if` the loop becomes: a call in the middle of the body, and one at its end.
+import std::vec;
+
+fn bump(x : &mut i32) -> i32 {
+  *x = *x + 1;
+  return *x;
+}
+
+fn main() -> i32 {
+  let mut v = Vec<i32>::new();
+  let mut i = 0;
+  while i < 4 {
+    v.push(10);
+    i = i + 1;
+  }
+  print!("pushed=");
+  print(v.len());
+  print!(";");
+
+  let mut n = 0;
+  while n < 5 {
+    bump(&mut n);
+  }
+  print!("bumped=");
+  print(n);
+  print!(";");
+  return 0;
+}
+
+// EXPECT: pushed=4;
+// EXPECT: bumped=5;

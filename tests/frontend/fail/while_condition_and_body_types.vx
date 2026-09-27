@@ -7,7 +7,8 @@
 //===----------------------------------------------------------------------===//
 // A `while` condition must be a `bool`, and its body must not end in a value.
 // `while` is checked as the `loop { if cond { body } else { break } }` it
-// becomes, so both messages name an `if`.
+// becomes, so both messages name an `if`; the one that carries a location
+// points at the `while` keyword.
 // RUN: not vxc %s 2>&1 | FileCheck %s
 
 fn int_condition() -> i32 {
@@ -27,7 +28,7 @@ fn body_has_a_value() -> i32 {
   }
   return 0;
 }
-// CHECK: Error[E3007]{{.*}}If expression branches have incompatible types
+// CHECK: Error[E3007] at 25:3: If expression branches have incompatible types
 
 fn main() -> i32 {
   return 0;
