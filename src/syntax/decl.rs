@@ -19,12 +19,49 @@ pub enum GenericParam {
     /// `T : A + B`, and all of them have to hold; an unconstrained parameter has none.
     Type {
         name: Symbol,
-        bounds: Vec<Symbol>,
+        bounds: Vec<TraitBound>,
     },
     Const {
         name: Symbol,
         ty: Type,
     },
+}
+
+/// One bound on a type parameter: the trait, with the type arguments it is given and what its
+/// associated types must be. `Sum<i64>` has one argument, `Iterator<Item = i64>` one binding,
+/// and a plain `Ord` neither.
+#[derive(Debug, PartialEq, Clone)]
+pub struct TraitBound {
+    pub trait_name: Symbol,
+    pub args: Vec<Type>,
+    pub bindings: Vec<(Symbol, Type)>,
+}
+
+impl TraitBound {
+    /// A bound that names a trait and nothing more.
+    pub fn named(trait_name: &str) -> Self {
+        Self {
+            trait_name: trait_name.into(),
+            args: Vec::new(),
+            bindings: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for TraitBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.trait_name)?;
+        if self.args.is_empty() && self.bindings.is_empty() {
+            return Ok(());
+        }
+        let args = self.args.iter().map(|a| a.to_string());
+        let bindings = self.bindings.iter().map(|(n, t)| format!("{n} = {t}"));
+        write!(
+            f,
+            "<{}>",
+            args.chain(bindings).collect::<Vec<_>>().join(", ")
+        )
+    }
 }
 
 impl GenericParam {
@@ -145,6 +182,11 @@ pub struct ImplBlock {
     pub methods: Vec<Function>,
     /// `type Item = i64;`. What this impl binds each of the trait's associated types to.
     pub assoc_bindings: Vec<(Symbol, Type)>,
+    /// The methods in `methods` that were copied from the trait's default bodies rather than
+    /// written in this impl. They are checked only when something calls them, as Rust checks a
+    /// default's bounds only at the call: `Iterator::sum` needs `Sum` on the item type, and an
+    /// iterator over structs must still compile when it never calls `sum`.
+    pub copied_defaults: Vec<Symbol>,
 }
 
 impl ImplBlock {
@@ -155,6 +197,7 @@ impl ImplBlock {
             trait_args: self.trait_args.clone(),
             target_type: self.target_type.clone(),
             assoc_bindings: self.assoc_bindings.clone(),
+            copied_defaults: self.copied_defaults.clone(),
             // Always preserve method bodies: methods only exist in impl blocks, so
             // method-call monomorphization clones the body from the type-check env
             // (env.impls). Dropping it (as the signature clone does for free

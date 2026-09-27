@@ -22,6 +22,7 @@ const KNOWN_DECLINES: &[&str] = &[
     "backend/pass/matmul_assign_alias.vx",
     // "A borrow of something that is not a tensor": the flat path borrows tensors only.
     "backend/pass/borrow_of_a_value.vx",
+    "backend/pass/borrow_element_through_pointer.vx",
     // `Option::or` and its neighbours, which answer with an `Option<T>`. The flat path
     // declines them as "a non-scalar default return" -- the same shape as the file below,
     // and the AST path handles both. The module's other methods answer with a `T` or a
@@ -43,6 +44,12 @@ const KNOWN_DECLINES: &[&str] = &[
     "backend/pass/core_iter_extend.vx",
     "backend/pass/core_iter_exact_size.vx",
     "backend/pass/core_iter_compare.vx",
+    "backend/pass/core_iter_try_fold.vx",
+    "backend/pass/core_iter_cycle.vx",
+    // A user iterator over a struct, which `main` builds and consumes: "a callee return type".
+    "backend/pass/iterator_over_structs.vx",
+    // Generic functions answering generic instances: "a callee return type", as above.
+    "backend/pass/bounds_with_type_arguments.vx",
     // A closure passed to a generic function: the flat emitter has no path for the call yet.
     "warnings/pass/w1001_a_called_local_is_used.vx",
     // "An enum with no modelled instance layout": `Option` of a tuple.
@@ -100,6 +107,8 @@ const KNOWN_DECLINES: &[&str] = &[
     // The same shape again, with a warning added: it states that a program checked by both
     // frontends has its warnings reported once, which needs a program that declines.
     "frontend/pass/jobs_warns_once_when_it_falls_back.vx",
+    // Same decline as `backend/pass/iterator_over_structs.vx`, through `vxc -j`.
+    "frontend/pass/jobs_iterator_over_structs.vx",
     "frontend/pass/trait_topologies.vx",
     // A parameter with run-time extents (Vx#409). It used to compile through the flat path
     // while the dims-less spelling let it read as rank-0: `topology.vx` got a `memref<f32>`
