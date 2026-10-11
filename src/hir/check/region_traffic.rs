@@ -118,9 +118,19 @@ type Placed = Result<(MemorySpace, u64), String>;
 /// precisely the undercount this stage must never produce. Found by probing, not by review.
 type PlacedMap = std::collections::HashMap<String, Placed>;
 
-/// Names bound inside the region body: `Some` when the binding is placed, `None` when the walk
-/// has determined it is not. A body-local `let` shadows an outer name of the same spelling.
-type Bindings = std::collections::HashMap<String, Option<Placed>>;
+/// What a name bound inside the region body denotes.
+#[derive(Clone)]
+struct Binding {
+    /// `Some` when the binding is placed, `None` when the walk has determined it is not.
+    placed: Option<Placed>,
+    /// The tensor a view is part of: `g` for `let r = g[1]`. Reads through `r` are reads of
+    /// `g`. `None` for a binding that is not a view.
+    charge_to: Option<String>,
+}
+
+/// Names bound inside the region body. A body-local `let` shadows an outer name of the same
+/// spelling.
+type Bindings = std::collections::HashMap<String, Binding>;
 
 /// Does this subtree contain any index access at all?
 ///
@@ -242,7 +252,7 @@ impl<'a> TypeChecker<'a> {
     /// then the snapshot of the enclosing scopes.
     fn region_placed(&self, name: &str, outer: &PlacedMap, binds: &Bindings) -> Option<Placed> {
         if let Some(entry) = binds.get(name) {
-            return entry.clone();
+            return entry.placed.clone();
         }
         outer.get(name).cloned()
     }
@@ -281,11 +291,84 @@ impl<'a> TypeChecker<'a> {
                     .to_string(),
             );
         };
-        let name = id.name.as_ref().to_string();
-        match self.region_placed(&name, outer, binds) {
-            Some(Ok((space, elem))) => Ok(Some((name, space, elem))),
+        let reached = id.name.as_ref();
+        // A view (`r` in `let r = g[1]`) is part of its owner's memory, so a read through it
+        // is booked against the owner. Every other name is booked against itself.
+        let charge = binds
+            .get(reached)
+            .and_then(|b| b.charge_to.clone())
+            .unwrap_or_else(|| reached.to_string());
+        match self.region_placed(reached, outer, binds) {
+            Some(Ok((space, elem))) => Ok(Some((charge, space, elem))),
             Some(Err(why)) => Err(why),
             None => Ok(None),
+        }
+    }
+
+    /// When `let` makes a view (`let r = g[1]`, `g.reshape(..)`, `h.t`), the one tensor it is
+    /// part of. Only asked at the region's top level: the scope of a nested block has ended by
+    /// the time this walk runs, so its binding's type is gone.
+    ///
+    /// A view that may be part of several tensors, or that an `if` or `match` chooses, is not
+    /// counted yet: charging its reads to one tensor would report a wrong number as exact.
+    fn region_view_owner(
+        &self,
+        l: &LetDeclStmt,
+        top_level: bool,
+    ) -> Result<Option<String>, String> {
+        if !top_level {
+            return Ok(None);
+        }
+        let ty = match &l.ty_ann {
+            Some(ann) => ann.clone(),
+            None => match self.lookup(l.name.as_ref()) {
+                Some((ty, _)) => ty.clone(),
+                None => return Ok(None),
+            },
+        };
+        let Some(view) = self.view_of(&l.expr, &ty) else {
+            return Ok(None);
+        };
+        let mut owners: Vec<&String> = view.owners.iter().map(|(name, _)| name).collect();
+        owners.sort();
+        owners.dedup();
+        if owners.len() != 1 || matches!(l.expr, Expr::If(_) | Expr::Match(_)) {
+            return Err(format!(
+                "the view `{}` may be part of more than one tensor, and reads through it are \
+                 not counted yet",
+                l.name
+            ));
+        }
+        Ok(Some(owners[0].clone()))
+    }
+
+    /// The reads a view's own expression makes: its subscripts (`p[0]` in `g[p[0]]`) and the
+    /// arguments of `reshape`. The tensor it views is not read.
+    #[allow(clippy::too_many_arguments)]
+    fn region_view_subscripts(
+        &self,
+        e: &Expr,
+        mult: u64,
+        acc: &mut RegionAcc,
+        exact: &mut bool,
+        outer: &PlacedMap,
+        binds: &mut Bindings,
+    ) -> Result<(), String> {
+        match e {
+            Expr::IndexAccess(ix) => {
+                self.region_expr(&ix.index, mult, acc, exact, outer, binds)?;
+                self.region_view_subscripts(&ix.base, mult, acc, exact, outer, binds)
+            }
+            Expr::MemberAccess(m) => {
+                self.region_view_subscripts(&m.base, mult, acc, exact, outer, binds)
+            }
+            Expr::MethodCall(mc) => {
+                for a in &mc.args {
+                    self.region_expr(a, mult, acc, exact, outer, binds)?;
+                }
+                self.region_view_subscripts(&mc.base, mult, acc, exact, outer, binds)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -412,7 +495,13 @@ impl<'a> TypeChecker<'a> {
         for s in stmts {
             match s {
                 Statement::LetDecl(l) => {
-                    self.region_expr(&l.expr, mult, acc, exact, outer, binds)?;
+                    // Making a view loads nothing; only the reads in its subscripts count.
+                    let owner = self.region_view_owner(l, top_level)?;
+                    if owner.is_some() {
+                        self.region_view_subscripts(&l.expr, mult, acc, exact, outer, binds)?;
+                    } else {
+                        self.region_expr(&l.expr, mult, acc, exact, outer, binds)?;
+                    }
                     // Record what this name now denotes, so a later index through it is
                     // attributed to the right space -- and so a scratch tile declared in the
                     // body is remembered as unplaced rather than resolved against an outer
@@ -472,7 +561,13 @@ impl<'a> TypeChecker<'a> {
                                 ))
                             }
                         });
-                    binds.insert(l.name.as_ref().to_string(), placed);
+                    binds.insert(
+                        l.name.as_ref().to_string(),
+                        Binding {
+                            placed,
+                            charge_to: owner,
+                        },
+                    );
                 }
                 Statement::Return(r) => {
                     if let Some(e) = &r.expr {
@@ -522,7 +617,13 @@ impl<'a> TypeChecker<'a> {
                     // The induction variable is a fresh scalar, and the body's own bindings
                     // must not leak out of the loop.
                     let mut inner = binds.clone();
-                    inner.insert(fl.iter.clone(), None);
+                    inner.insert(
+                        fl.iter.clone(),
+                        Binding {
+                            placed: None,
+                            charge_to: None,
+                        },
+                    );
                     self.region_stmts(&fl.body, next, acc, exact, outer, &mut inner, false)?;
                 }
                 Statement::Loop(_) => {
@@ -864,7 +965,7 @@ impl<'a> TypeChecker<'a> {
                 let placed_names = outer.keys().cloned().chain(
                     binds
                         .iter()
-                        .filter(|(_, v)| v.is_some())
+                        .filter(|(_, v)| v.placed.is_some())
                         .map(|(k, _)| k.clone()),
                 );
                 if mentions_any(other, placed_names) {
@@ -972,7 +1073,7 @@ impl<'a> TypeChecker<'a> {
             .chain(
                 binds
                     .iter()
-                    .filter(|(_, v)| v.is_some())
+                    .filter(|(_, v)| v.placed.is_some())
                     .map(|(k, _)| k.clone()),
             )
             .collect();

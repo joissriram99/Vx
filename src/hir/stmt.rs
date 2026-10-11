@@ -298,11 +298,13 @@ impl<'a> TypeChecker<'a> {
                 .insert(name.to_string().into(), val);
         }
 
-        // A `transfer(..)` validates its destination and records the tile it lands, at its own
-        // site. The binding adds nothing: checking its type as well reported the same overflow
-        // twice, counted one tile as two, and re-litigated a destination the transfer had
-        // already accepted.
-        let initializer_places_its_own = matches!(expr, Expr::Transfer(_));
+        // The binding records no tile when its memory is already recorded. A `transfer(..)`
+        // validates its destination and records the tile it lands, at its own site. A view
+        // (`g[1]`, `h.t`, `g.reshape(..)`) is part of a tile its owner already holds. Checking
+        // the binding's type as well counted one tile as two and reported the same overflow
+        // twice.
+        let memory_already_recorded =
+            matches!(expr, Expr::Transfer(_)) || self.view_of(expr, &ty).is_some();
         let context = format!("variable '{}'", name);
         let binding_ty = if let Some(ann) = ty_ann {
             // `Unknown` is the poison type of an already-reported failure (an unresolved call, a
@@ -331,7 +333,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             // Capacity: a placed tensor annotation must fit its memory space.
-            if !initializer_places_its_own {
+            if !memory_already_recorded {
                 self.check_type_placement(ann, &context, span);
             }
             self.insert(name.to_string(), ann.clone());
@@ -341,7 +343,7 @@ impl<'a> TypeChecker<'a> {
             // so the inferred type gets the same check. Without this, every placement written
             // only in the initializer -- the ordinary spelling -- escaped capacity admission,
             // element-type admission, and the working set.
-            if !initializer_places_its_own {
+            if !memory_already_recorded {
                 self.check_type_placement(&ty, &context, span);
             }
             self.insert(name.to_string(), ty.clone());

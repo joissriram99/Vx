@@ -1068,3 +1068,216 @@ fn main() -> i32 {
         "an unfollowable write is uncountable, never a confident zero:\n{region}"
     );
 }
+
+// A view -- a row `ad[1]`, a reshape, a struct field, or a view of one of these -- is part of
+// a buffer that already exists. Making one loads nothing, and a read through it is a read of
+// that buffer. Each case below asserts the exact per-buffer record, so a buffer named after a
+// view (`r`, `s`, `t`) fails it as surely as a wrong byte count does.
+
+/// The region record of `main` for a program whose region body is `body`.
+fn view_region(stem: &str, body: &str) -> String {
+    spawn_region(&record_source(stem, &region_body(body)), "main")
+}
+
+/// The record for a region that reads `bytes` from `ad` and nothing else.
+fn reads_only_ad(bytes: u64) -> String {
+    format!(
+        "\"by_buffer\": [{{\"buffer\": \"ad\", \"space\": \"GPU_HBM\", \"read_bytes\": {bytes}, \
+         \"written_bytes\": 0}}]"
+    )
+}
+
+#[test]
+fn a_read_through_a_row_view_is_a_read_of_its_tensor() {
+    let region = view_region(
+        "view_row_read",
+        "    let r = ad[1];
+    let x = r[0];",
+    );
+    assert!(
+        region.contains(&reads_only_ad(4)),
+        "one element read through `r`, booked against `ad`; making `r` reads nothing:\n{region}"
+    );
+}
+
+#[test]
+fn a_view_that_is_never_read_moves_nothing() {
+    let region = view_region("view_unread", "    let r = ad[1];");
+    assert!(
+        region.contains("\"traffic\": []") && region.contains("\"by_buffer\": []"),
+        "making a view loads nothing, and the count is exact, not absent:\n{region}"
+    );
+}
+
+#[test]
+fn two_views_of_one_tensor_are_one_buffer() {
+    let region = view_region(
+        "view_two_rows",
+        "    let r = ad[0];
+    let s = ad[1];
+    let x = r[0] + s[1];",
+    );
+    assert!(
+        region.contains(&reads_only_ad(8)),
+        "two elements, one from each row, both booked against `ad`:\n{region}"
+    );
+}
+
+#[test]
+fn a_view_of_a_view_is_read_through_the_first_tensor() {
+    let region = view_region(
+        "view_of_view",
+        "    let r = ad[1];
+    let s = r;
+    let x = s[1];",
+    );
+    assert!(
+        region.contains(&reads_only_ad(4)),
+        "`s` views `r`, which views `ad`, so its read is booked against `ad`:\n{region}"
+    );
+}
+
+#[test]
+fn a_reshape_is_a_view_not_an_uncountable_call() {
+    let region = view_region(
+        "view_reshape",
+        "    let f = ad.reshape([4]);
+    let x = f[2];",
+    );
+    assert!(
+        region.contains(&reads_only_ad(4)),
+        "a reshape reads nothing, so the region stays countable:\n{region}"
+    );
+}
+
+/// The control for the case above: a copy really is a call whose reads are hidden, so the
+/// region must stay absent.
+#[test]
+fn a_copy_of_a_tensor_is_still_an_uncountable_call() {
+    let region = view_region(
+        "view_clone",
+        "    let c = ad.clone();
+    let x = c[0][0];",
+    );
+    assert!(
+        region.contains("\"traffic\": null") && region.contains("passes a placed tensor to a call"),
+        "`clone` reads `ad` inside a call this counter cannot see:\n{region}"
+    );
+}
+
+#[test]
+fn reads_through_a_view_inside_a_loop_are_reads_of_its_tensor() {
+    let region = view_region(
+        "view_read_in_loop",
+        "    let r = ad[1];
+    for k in 0..2 {
+      let y = r[k];
+    }",
+    );
+    assert!(
+        region.contains(&reads_only_ad(8)),
+        "two reads through `r`, one per iteration, booked against `ad`:\n{region}"
+    );
+}
+
+/// Recognising a view looks up the binding's type, which is only in scope at the region's top
+/// level. A binding inside a loop must still be counted, not make the region absent.
+#[test]
+fn a_binding_inside_a_loop_is_still_counted() {
+    let region = view_region(
+        "view_nested_binding",
+        "    for i in 0..2 {
+      let y = ad[i][0];
+    }",
+    );
+    assert!(
+        region.contains(&reads_only_ad(8)),
+        "two elements read inside the loop:\n{region}"
+    );
+}
+
+#[test]
+fn a_field_view_is_read_through_the_struct_that_holds_it() {
+    let src = "\
+Memory CPU_DRAM {}
+Memory GPU_HBM {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s
+}
+struct H {
+  t : Tensor<f32, [2, 2], Memory::GPU_HBM>,
+}
+fn main() -> i32 {
+  let a = Tensor<f32, [2, 2]>::fill(1.0);
+  let h = H { t : transfer(a, Memory::GPU_HBM) };
+  spawn on(Topology::GPU) {
+    let t = h.t;
+    let x = t[1][0];
+  }
+  return 0;
+}
+";
+    let region = spawn_region(&record_source("view_field", src), "main");
+    assert!(
+        region.contains("\"traffic\": [{\"space\": \"GPU_HBM\", \"read_bytes\": 4,")
+            && !region.contains("\"buffer\": \"t\""),
+        "one element read through the field view, not booked against `t`:\n{region}"
+    );
+}
+
+/// `ad` and a placed tensor `k`, both 2 x 2 `f32`, with `body` inside the region.
+fn two_tensor_region(stem: &str, body: &str) -> String {
+    let src = format!(
+        "Memory CPU_DRAM {{}}
+Memory GPU_HBM {{
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s
+}}
+fn main() -> i32 {{
+  let a = Tensor<f32, [2, 2]>::fill(1.0);
+  let b = Tensor<f32, [2, 2]>::fill(2.0);
+  let ad = transfer(a, Memory::GPU_HBM);
+  let k = transfer(b, Memory::GPU_HBM);
+  spawn on(Topology::GPU) {{
+{body}
+  }}
+  return 0;
+}}
+"
+    );
+    spawn_region(&record_source(stem, &src), "main")
+}
+
+#[test]
+fn a_read_inside_a_views_subscript_is_counted() {
+    let region = two_tensor_region(
+        "view_subscript_read",
+        "    let r = ad[k[0][0] as i64];
+    let x = r[0];",
+    );
+    assert!(
+        region.contains(
+            "\"by_buffer\": [{\"buffer\": \"ad\", \"space\": \"GPU_HBM\", \"read_bytes\": 4, \
+             \"written_bytes\": 0}, {\"buffer\": \"k\", \"space\": \"GPU_HBM\", \
+             \"read_bytes\": 4, \"written_bytes\": 0}]"
+        ),
+        "one element of `k` for the subscript, one of `ad` through `r`:\n{region}"
+    );
+}
+
+// Which tensor `r` reads is only known when the program runs. Charging every read to the
+// first tensor would report a wrong number as exact, so for now the region has no count.
+// A runtime `if` elsewhere is counted as an upper bound (each buffer's larger arm, marked
+// inexact); doing the same here would report 4 bytes of `ad` and 4 of `k`.
+#[test]
+fn a_view_chosen_from_two_tensors_is_not_counted_yet() {
+    let region = two_tensor_region(
+        "view_from_two_tensors",
+        "    let c = true;
+    let r = if c { ad[0] } else { k[0] };
+    let x = r[1];",
+    );
+    assert!(
+        region.contains("\"traffic\": null")
+            && region.contains("the view `r` may be part of more than one tensor"),
+        "the region has no count, and says why:\n{region}"
+    );
+}
