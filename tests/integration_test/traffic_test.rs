@@ -1263,12 +1263,25 @@ fn a_read_inside_a_views_subscript_is_counted() {
     );
 }
 
-// Which tensor `r` reads is only known when the program runs. Charging every read to the
-// first tensor would report a wrong number as exact, so for now the region has no count.
-// A runtime `if` elsewhere is counted as an upper bound (each buffer's larger arm, marked
-// inexact); doing the same here would report 4 bytes of `ad` and 4 of `k`.
+/// The record for a region whose reads from `ad` and `k` are `(ad, k)` bytes. `k` is left out
+/// when it is 0, as the record leaves out a buffer the region never reads.
+fn reads_of_ad_and_k(ad: u64, k: u64) -> String {
+    let ad_entry =
+        format!("{{\"buffer\": \"ad\", \"space\": \"GPU_HBM\", \"read_bytes\": {ad}, \"written_bytes\": 0}}");
+    if k == 0 {
+        return format!("\"by_buffer\": [{ad_entry}]");
+    }
+    format!(
+        "\"by_buffer\": [{ad_entry}, {{\"buffer\": \"k\", \"space\": \"GPU_HBM\", \"read_bytes\": {k}, \
+         \"written_bytes\": 0}}]"
+    )
+}
+
+// Which tensor `r` is a row of is only known when the program runs, and one run reads just
+// one of them. So, like a runtime `if`, the read is counted against both, and the count is
+// marked as an upper bound rather than exact.
 #[test]
-fn a_view_chosen_from_two_tensors_is_not_counted_yet() {
+fn a_view_chosen_from_two_tensors_is_charged_to_both() {
     let region = two_tensor_region(
         "view_from_two_tensors",
         "    let c = true;
@@ -1276,8 +1289,97 @@ fn a_view_chosen_from_two_tensors_is_not_counted_yet() {
     let x = r[1];",
     );
     assert!(
-        region.contains("\"traffic\": null")
-            && region.contains("the view `r` may be part of more than one tensor"),
-        "the region has no count, and says why:\n{region}"
+        region.contains("\"traffic_exact\": false") && region.contains(&reads_of_ad_and_k(4, 4)),
+        "one element read through `r`, counted against `ad` and `k`, not exact:\n{region}"
+    );
+}
+
+#[test]
+fn a_view_chosen_from_rows_of_one_tensor_stays_exact() {
+    let region = two_tensor_region(
+        "view_from_two_rows",
+        "    let c = true;
+    let r = if c { ad[0] } else { ad[1] };
+    let x = r[1];",
+    );
+    assert!(
+        region.contains("\"traffic_exact\": true") && region.contains(&reads_of_ad_and_k(4, 0)),
+        "both rows are part of `ad`, so the one read is exactly 4 bytes of `ad`:\n{region}"
+    );
+}
+
+// The condition is checked on every run, so its read of `k` adds to the read through `r`:
+// on the run that picks `k[0]`, `k` is read twice.
+#[test]
+fn a_read_in_the_condition_that_chooses_a_view_is_counted() {
+    let region = two_tensor_region(
+        "view_if_condition_read",
+        "    let r = if k[1][1] > 0.0 { ad[0] } else { k[0] };
+    let x = r[1];",
+    );
+    assert!(
+        region.contains("\"traffic_exact\": false") && region.contains(&reads_of_ad_and_k(4, 8)),
+        "4 bytes of `k` for the condition, and 4 through `r` from `ad` or `k`:\n{region}"
+    );
+}
+
+#[test]
+fn a_read_in_the_value_a_match_looks_at_is_counted() {
+    let region = two_tensor_region(
+        "view_match_value_read",
+        "    let r = match k[0][0] as i32 { 0 => { ad[0] } _ => { k[0] } };
+    let x = r[1];",
+    );
+    assert!(
+        region.contains("\"traffic_exact\": false") && region.contains(&reads_of_ad_and_k(4, 8)),
+        "4 bytes of `k` for the matched value, and 4 through `r` from `ad` or `k`:\n{region}"
+    );
+}
+
+// Only the first arm reads `k`, in its subscript. One run takes one arm, so `k` is read at
+// most once, and the count is not exact because the two arms read different amounts.
+#[test]
+fn a_read_in_one_arms_subscript_is_counted_once() {
+    let region = two_tensor_region(
+        "view_arm_subscript_read",
+        "    let c = true;
+    let r = if c { ad[k[0][0] as i64] } else { ad[1] };
+    let x = r[1];",
+    );
+    assert!(
+        region.contains("\"traffic_exact\": false") && region.contains(&reads_of_ad_and_k(4, 4)),
+        "at most 4 bytes of `k` from the first arm, and 4 of `ad` through `r`:\n{region}"
+    );
+}
+
+#[test]
+fn a_write_through_a_view_of_two_tensors_is_not_exact() {
+    let src = "\
+Memory CPU_DRAM {}
+Memory GPU_HBM {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s
+}
+fn main() -> i32 {
+  let a = Tensor<f32, [2, 2]>::fill(1.0);
+  let b = Tensor<f32, [2, 2]>::fill(2.0);
+  let mut ad = transfer(a, Memory::GPU_HBM);
+  let mut k = transfer(b, Memory::GPU_HBM);
+  let c = true;
+  spawn on(Topology::GPU) {
+    let mut r = if c { ad[0] } else { k[0] };
+    r[1] = 3.0;
+  }
+  return 0;
+}
+";
+    let region = spawn_region(&record_source("view_write_two_tensors", src), "main");
+    assert!(
+        region.contains("\"traffic_exact\": false")
+            && region.contains(
+                "\"by_buffer\": [{\"buffer\": \"ad\", \"space\": \"GPU_HBM\", \"read_bytes\": 0, \
+                 \"written_bytes\": 4}, {\"buffer\": \"k\", \"space\": \"GPU_HBM\", \
+                 \"read_bytes\": 0, \"written_bytes\": 4}]"
+            ),
+        "one element written through `r`, into `ad` or `k`, so at most 4 bytes each:\n{region}"
     );
 }
