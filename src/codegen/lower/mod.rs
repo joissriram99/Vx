@@ -751,6 +751,38 @@ pub fn generate_match_chain<'c>(
                 }
                 None => (payload_val, payload_ty),
             };
+            // A float kept in an integer slot comes back out from its bits.
+            let declared_float =
+                declared_payload_ty(gen, en.as_ref(), vn.as_ref(), position, &opt_ty_str).filter(
+                    |text| {
+                        crate::codegen::generator::is_float_text(text)
+                            && payload_ty_str.starts_with('i')
+                    },
+                );
+            let (payload_val, payload_ty) = match declared_float {
+                Some(text) => {
+                    let bits = crate::codegen::generator::scalar_type_bits(&text)
+                        .ok_or_else(|| LowerError::from(format!("a float of no width: {text}")))?;
+                    let mut val = payload_val;
+                    if payload_ty.to_string() != format!("i{bits}") {
+                        let as_int = melior::ir::Type::parse(gen.context, &format!("i{bits}"))
+                            .ok_or_else(|| LowerError::ParseType("Type::parse failed".into()))?;
+                        let trunc = OperationBuilder::new("arith.trunci", gen.loc())
+                            .add_operands(&[val])
+                            .add_results(&[as_int])
+                            .build()?;
+                        val = then_block.append_operation(trunc).result(0)?.into();
+                    }
+                    let ty = melior::ir::Type::parse(gen.context, &text)
+                        .ok_or_else(|| LowerError::ParseType("Type::parse failed".into()))?;
+                    let cast = OperationBuilder::new("arith.bitcast", gen.loc())
+                        .add_operands(&[val])
+                        .add_results(&[ty])
+                        .build()?;
+                    (then_block.append_operation(cast).result(0)?.into(), ty)
+                }
+                None => (payload_val, payload_ty),
+            };
             gen.note_shadow(name.as_ref());
             gen.env
                 .insert(name.to_string().into(), (payload_val, payload_ty));
@@ -1131,6 +1163,18 @@ pub(crate) fn lower_print_call<'c>(
     if let Expr::Borrow(borrow) = print_arg {
         print_arg = &borrow.expr;
     }
+    // The checker marks a tensor of `u32` or `u64` with a cast to its own type: MLIR integers
+    // carry no sign, and its runtime printer reads them signed.
+    let mut unsigned_tensor = false;
+    if let Expr::AsCast(cast) = print_arg {
+        if let syntax::Type::Tensor(e, _, _) = &cast.target_ty {
+            unsigned_tensor = matches!(
+                e,
+                syntax::types::ElementType::U32 | syntax::types::ElementType::U64
+            );
+            print_arg = &cast.expr;
+        }
+    }
 
     let (mut arg_val, arg_ty, block) = gen.generate_expr(print_arg, block)?;
 
@@ -1151,12 +1195,14 @@ pub(crate) fn lower_print_call<'c>(
 
     let el_ty_str = extract_mlir_element_type(&arg_ty.to_string())?;
 
-    let print_fn_name = match el_ty_str {
-        "f32" => "printMemrefF32",
-        "f64" => "printMemrefF64",
-        "i32" => "printMemrefI32",
-        "i64" => "printMemrefI64",
-        "bf16" => "printMemrefBF16",
+    let print_fn_name = match (el_ty_str, unsigned_tensor) {
+        ("f32", _) => "printMemrefF32",
+        ("f64", _) => "printMemrefF64",
+        ("i32", true) => "printMemrefU32",
+        ("i64", true) => "printMemrefU64",
+        ("i32", false) => "printMemrefI32",
+        ("i64", false) => "printMemrefI64",
+        ("bf16", _) => "printMemrefBF16",
         _ => return Err(LowerError::UnsupportedElementType(el_ty_str.to_string())),
     };
 
@@ -1179,6 +1225,29 @@ pub(crate) fn lower_print_call<'c>(
 
     let unranked_memref_ty = Type::parse(gen.context, &format!("memref<*x{}>", el_ty_str))
         .ok_or_else(|| LowerError::ParseType(format!("memref<*x{}>", el_ty_str)))?;
+    // Declared the first time a tensor of this element type is printed.
+    if gen.declared_tensor_prints.insert(print_fn_name) {
+        let func_ty = Type::parse(gen.context, &format!("({unranked_memref_ty}) -> ()"))
+            .ok_or_else(|| LowerError::ParseType(format!("({unranked_memref_ty}) -> ()")))?;
+        let decl = OperationBuilder::new("func.func", gen.loc())
+            .add_attributes(&[
+                (
+                    Identifier::new(gen.context, "sym_name"),
+                    StringAttribute::new(gen.context, print_fn_name).into(),
+                ),
+                (
+                    Identifier::new(gen.context, "function_type"),
+                    TypeAttribute::new(func_ty).into(),
+                ),
+                (
+                    Identifier::new(gen.context, "sym_visibility"),
+                    StringAttribute::new(gen.context, "private").into(),
+                ),
+            ])
+            .add_regions([melior::ir::Region::new()])
+            .build()?;
+        gen.module.body().append_operation(decl);
+    }
     let cast_op = block.append_operation(
         OperationBuilder::new("memref.cast", gen.loc())
             .add_operands(&[arg_val])
@@ -1236,6 +1305,7 @@ pub(crate) fn pick_scalar_print<'c>(
         ("i16", true) => ("print_u16", None),
         ("i32", true) => ("print_u32", None),
         ("i64", true) => ("print_u64", None),
+        ("i1", _) => ("print_bool", Some(("arith.extui", "i32"))),
         ("i8" | "i16", false) => ("print_i32", Some(("arith.extsi", "i32"))),
         ("i32", false) => ("print_i32", None),
         ("i64", false) => ("print_i64", None),
@@ -1265,9 +1335,30 @@ pub(crate) fn call_scalar_print<'c>(
     arg_val: Value<'c, 'c>,
     arg_ty_str: &str,
 ) -> Result<Value<'c, 'c>, LowerError> {
+    call_runtime_fn(gen, block, fn_name, &[(arg_val, arg_ty_str)], "i32")
+}
+
+/// Call a runtime function, declaring it first if the module does not have it yet. The
+/// declaration takes the given argument types, not the types of the values passed, so a later
+/// call is checked against the signature the declaration really has.
+pub(crate) fn call_runtime_fn<'c>(
+    gen: &mut MeliorGenerator<'c>,
+    block: melior::ir::BlockRef<'c, 'c>,
+    fn_name: &str,
+    args: &[(Value<'c, 'c>, &str)],
+    ret_ty_str: &str,
+) -> Result<Value<'c, 'c>, LowerError> {
+    let parse = |text: &str| {
+        Type::parse(gen.context, text).ok_or_else(|| LowerError::ParseType(text.to_string()))
+    };
+    let ret_ty = parse(ret_ty_str)?;
     if !gen.functions.contains_key(fn_name) {
-        let func_ty = Type::parse(gen.context, &format!("({}) -> i32", arg_ty_str))
-            .ok_or_else(|| LowerError::ParseType(format!("({}) -> i32", arg_ty_str)))?;
+        let arg_tys: Vec<&str> = args.iter().map(|(_, ty)| *ty).collect();
+        let func_ty = parse(&format!("({}) -> {ret_ty_str}", arg_tys.join(", ")))?;
+        let recorded_tys = arg_tys
+            .iter()
+            .map(|ty| parse(ty))
+            .collect::<Result<Vec<_>, _>>()?;
         let func_decl = OperationBuilder::new("func.func", gen.loc())
             .add_attributes(&[
                 (
@@ -1286,18 +1377,14 @@ pub(crate) fn call_scalar_print<'c>(
             .add_regions([melior::ir::Region::new()])
             .build()?;
         gen.module.body().append_operation(func_decl);
-        // Record the widened parameter type, not the source scalar's, or a
-        // later call would be checked against a signature the declaration
-        // does not have.
-        let recorded_ty = Type::parse(gen.context, arg_ty_str)
-            .ok_or_else(|| LowerError::ParseType(arg_ty_str.to_string()))?;
         gen.functions
-            .insert(fn_name.to_string().into(), (gen.i32_ty, vec![recorded_ty]));
+            .insert(fn_name.to_string().into(), (ret_ty, recorded_tys));
     }
+    let operands: Vec<Value<'c, 'c>> = args.iter().map(|(v, _)| *v).collect();
     let call_op = block.append_operation(
         OperationBuilder::new("func.call", gen.loc())
-            .add_operands(&[arg_val])
-            .add_results(&[gen.i32_ty])
+            .add_operands(&operands)
+            .add_results(&[ret_ty])
             .add_attributes(&[(
                 Identifier::new(gen.context, "callee"),
                 FlatSymbolRefAttribute::new(gen.context, fn_name).into(),

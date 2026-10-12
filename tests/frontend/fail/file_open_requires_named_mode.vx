@@ -1,0 +1,16 @@
+//===- file_open_requires_named_mode.vx - Vx Compiler ----------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// File::open accepts named modes, not raw integer values.
+// CHECK: Error[E3003]{{.*}}'File::open'. Expected OpenMode, got i32
+import std::fs;
+
+fn main() -> i32 {
+  unsafe { let _file = File::open("unused", 3); }
+  return 0;
+}

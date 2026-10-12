@@ -1,6 +1,6 @@
 //! Borrow-checking state whose coherence the frontend depends on: the active borrow records and the
-//! per-block liveness that decides which of them are dead (NLL). This is the chokepoint the frontend
-//! previously lacked (frontend_refactoring_borrow_checker.md, R1; #279).
+//! per-block liveness that decides which of them are dead (NLL). The rest of the frontend reads
+//! borrow records only through this module.
 //!
 //! The point of the module boundary is that `active_borrows` is **private** — no code outside this file
 //! can read it. The only conflict-check read path is [`BorrowCx::live_borrows`], which sweeps dead
@@ -22,8 +22,8 @@ pub(crate) struct BorrowCx {
     /// `variable -> its borrow records`. **Private**: readable for a conflict check only via
     /// [`Self::live_borrows`], which sweeps dead borrows before returning.
     active_borrows: HashMap<Symbol, Vec<BorrowRecord>>,
-    /// Per-block last-use index of each local (NLL). The innermost block is `.last()`.
-    block_liveness: Vec<HashMap<Symbol, usize>>,
+    /// What each open block names and declares (NLL). The innermost block is `.last()`.
+    block_liveness: Vec<BlockUses>,
     /// The statement index currently being checked, one entry per open block. Innermost is `.last()`.
     current_stmt_idx: Vec<usize>,
     /// Whether borrow-conflict checks are suppressed (e.g. while typing a member-access receiver,
@@ -55,6 +55,17 @@ pub(crate) struct BorrowCx {
     /// The tensors each view-making `let` may be part of, keyed by the `let`'s position. The
     /// traffic count reads it after the `let`'s scope has closed.
     pub(crate) view_owners_by_let: HashMap<crate::syntax::Span, Vec<String>>,
+}
+
+/// What the borrow checker needs to know about a block to decide when a borrow made in or
+/// before it ends.
+pub(crate) struct BlockUses {
+    /// The index of the last statement in the block that names each variable.
+    pub(crate) last_use: HashMap<Symbol, usize>,
+    /// The variables the block declares. Nothing outside the block can name them.
+    pub(crate) declared: HashSet<Symbol>,
+    /// A loop body runs again after its last statement.
+    pub(crate) is_loop: bool,
 }
 
 /// What a loop's `break`s carry out of it and its `continue`s carry into its next pass: the
@@ -89,9 +100,9 @@ impl Default for BorrowCx {
 impl BorrowCx {
     // --- NLL block liveness ---
 
-    /// Enter a block: install its precomputed last-use map and start at statement 0.
-    pub(crate) fn enter_block(&mut self, liveness: HashMap<Symbol, usize>) {
-        self.block_liveness.push(liveness);
+    /// Enter a block: install what it names and declares, and start at statement 0.
+    pub(crate) fn enter_block(&mut self, uses: BlockUses) {
+        self.block_liveness.push(uses);
         self.current_stmt_idx.push(0);
     }
 
@@ -116,21 +127,31 @@ impl BorrowCx {
     /// tile resident and is the conservative direction.
     pub(crate) fn is_variable_ever_read(&self, name: &str) -> bool {
         match self.block_liveness.last() {
-            Some(liveness) => liveness.contains_key(&Symbol::from(name)),
+            Some(block) => block.last_use.contains_key(&Symbol::from(name)),
             None => true,
         }
     }
 
-    /// Whether `name` is still read at a statement *after* the one currently being checked, in the
-    /// innermost block. The NLL predicate the dead-borrow sweep turns on.
+    /// Whether `name` is still used after the statement being checked. The NLL predicate the
+    /// dead-borrow sweep turns on.
+    ///
+    /// The blocks are searched from the innermost out. A block that names `name` in a later
+    /// statement answers yes. A block that declares `name` ends the search, since no block
+    /// around it can see that variable. A loop body that names a variable from outside it
+    /// answers yes too, because its next pass names it again.
     fn is_variable_used_after(&self, name: &str) -> bool {
-        if let (Some(liveness), Some(&current_idx)) =
-            (self.block_liveness.last(), self.current_stmt_idx.last())
-        {
-            return liveness
-                .get(name)
-                .map(|&u| u > current_idx)
-                .unwrap_or(false);
+        let blocks = self.block_liveness.iter().zip(&self.current_stmt_idx);
+        for (block, &current_idx) in blocks.rev() {
+            let last_use = block.last_use.get(name);
+            if last_use.is_some_and(|&u| u > current_idx) {
+                return true;
+            }
+            if block.declared.contains(name) {
+                return false;
+            }
+            if block.is_loop && last_use.is_some() {
+                return true;
+            }
         }
         false
     }

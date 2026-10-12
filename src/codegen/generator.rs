@@ -40,8 +40,13 @@ pub struct MeliorGenerator<'c> {
     /// Locals bound to a tensor the compiler allocated, as against a view over memory it does
     /// not control. Only these can be filled in place by `c = a @ b` (Vx#391).
     pub(crate) owned_tensors: std::collections::HashSet<crate::symbol::Symbol>,
+    /// The `printMemref*` helpers declared so far; each is declared on its first use.
+    pub(crate) declared_tensor_prints: std::collections::HashSet<&'static str>,
     /// Locals whose element pointer the function takes: a view through it can share their memory.
     pub(crate) pointer_taken: std::collections::HashSet<crate::symbol::Symbol>,
+    /// The locals of the function being lowered that are borrowed with `&x`. Each gets a stack
+    /// slot, so every borrow of it is the same address.
+    pub(crate) address_taken: std::collections::HashSet<crate::symbol::Symbol>,
     /// Declared memory spaces, keyed by space, so a `transfer` can emit the sub-space descriptor
     /// (granule/capacity/scope/parent) as IR metadata for later passes (see subspace_scheduling.md).
     pub(crate) memories: HashMap<syntax::MemorySpace, syntax::MemoryDecl>,
@@ -162,6 +167,56 @@ pub(crate) fn strip_memref_space(s: &str) -> Option<String> {
     Some(format!("memref<{head}>"))
 }
 
+/// The functions in `operations` without the imported ones (the first `imported`) that nothing
+/// reaches: an imported module's function is emitted only when the program calls it, directly
+/// or through another function it calls. A function is reached by any `@name` in a reached
+/// function's code. Also returns every name the kept functions refer to.
+fn keep_reached_functions<'c>(
+    operations: Vec<melior::ir::Operation<'c>>,
+    imported: usize,
+) -> (
+    Vec<melior::ir::Operation<'c>>,
+    std::collections::HashSet<String>,
+) {
+    use melior::ir::operation::OperationLike;
+    let symbol = regex::Regex::new(r#"@(?:"((?:[^"\\]|\\.)*)"|([A-Za-z0-9_$.]+))"#)
+        .expect("a valid pattern");
+    let texts: Vec<String> = operations.iter().map(|op| op.to_string()).collect();
+    let names: HashMap<String, usize> = operations
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| {
+            let name = op.attribute("sym_name").ok()?;
+            let name = melior::ir::attribute::StringAttribute::try_from(name).ok()?;
+            Some((name.value().to_string(), i))
+        })
+        .collect();
+    let mut reached: Vec<bool> = (0..operations.len()).map(|i| i >= imported).collect();
+    let mut pending: Vec<usize> = (imported..operations.len()).collect();
+    let mut referenced = std::collections::HashSet::new();
+    while let Some(i) = pending.pop() {
+        for found in symbol.captures_iter(&texts[i]) {
+            let name = found
+                .get(1)
+                .or_else(|| found.get(2))
+                .map_or("", |m| m.as_str());
+            referenced.insert(name.to_string());
+            if let Some(&j) = names.get(name) {
+                if !reached[j] {
+                    reached[j] = true;
+                    pending.push(j);
+                }
+            }
+        }
+    }
+    let kept = operations
+        .into_iter()
+        .zip(reached)
+        .filter_map(|(op, keep)| keep.then_some(op))
+        .collect();
+    (kept, referenced)
+}
+
 /// Whether a lowered return type travels through a buffer the caller allocated, rather than
 /// coming back by value: a tensor whose extents are all known at compile time.
 ///
@@ -186,6 +241,11 @@ pub(crate) fn scalar_type_bits(ty_text: &str) -> Option<u32> {
         "f64" => Some(64),
         _ => None,
     }
+}
+
+/// Whether an MLIR type spelling is a float type.
+pub(crate) fn is_float_text(ty_text: &str) -> bool {
+    matches!(ty_text, "f16" | "bf16" | "f32" | "f64")
 }
 
 /// A drop waiting for the value of the statement it precedes.
@@ -279,6 +339,10 @@ impl<'c> MeliorGenerator<'c> {
         ret_ty: Type<'c>,
         arg_tys: &[Type<'c>],
     ) -> (Option<Type<'c>>, Vec<Type<'c>>) {
+        // A `void` function has no result, both in its definition and in the type of its address.
+        if ret_ty == self.none_ty {
+            return (None, arg_tys.to_vec());
+        }
         if !returns_through_slot(&ret_ty.to_string()) {
             return (Some(ret_ty), arg_tys.to_vec());
         }
@@ -301,11 +365,6 @@ impl<'c> MeliorGenerator<'c> {
         ty_str.starts_with("memref<")
             && !ty_str.contains('x')
             && !ty_str.starts_with("memref<memref<")
-    }
-
-    pub fn is_llvm_ptr(&self, ty: &Type<'c>) -> bool {
-        let ty_str = ty.to_string();
-        ty_str.starts_with("!llvm.ptr") || ty_str.starts_with("!llvm.array")
     }
 
     /// Adapt a closure-literal environment struct (`Closure_N`, the by-value capture record) to a
@@ -741,7 +800,9 @@ impl<'c> MeliorGenerator<'c> {
             env: HashMap::new(),
             ast_env: HashMap::new(),
             owned_tensors: std::collections::HashSet::new(),
+            declared_tensor_prints: std::collections::HashSet::new(),
             pointer_taken: std::collections::HashSet::new(),
+            address_taken: std::collections::HashSet::new(),
             memories: HashMap::new(),
             transfer_impls: HashMap::new(),
             topologies: HashMap::new(),
@@ -828,6 +889,17 @@ impl<'c> MeliorGenerator<'c> {
             .set_attribute("vx.drops", melior::ir::Attribute::unit(self.context));
 
         self.generate_module(program, modules)?;
+
+        // After `generate_module`, which is what fills `self.topologies`.
+        let local_devices = crate::arch::local_device_aliases(self.topologies.iter());
+        let attr = crate::codegen::flat::local_devices_attr(&local_devices);
+        if let Some(value) = attr.strip_prefix(", vx.local_devices = ") {
+            let value = melior::ir::Attribute::parse(self.context, value)
+                .expect("vx.local_devices is a valid array attribute");
+            self.module
+                .as_operation_mut()
+                .set_attribute("vx.local_devices", value);
+        }
 
         let op = self.module.as_operation();
         let s = format!("{}", op);
@@ -980,38 +1052,6 @@ impl<'c> MeliorGenerator<'c> {
             self.functions.insert(ext.name.clone(), (ret_ty, arg_tys));
         }
 
-        // Declare printMemref functions
-        for ty_str in &["f32", "f64", "i32", "i64", "bf16"] {
-            let func_name = format!("printMemref{}", ty_str.to_uppercase());
-            let unranked_memref_ty =
-                Type::parse(self.context, &format!("memref<*x{}>", ty_str)).unwrap();
-
-            let func_ty = melior::ir::attribute::TypeAttribute::new(
-                Type::parse(self.context, &format!("({unranked_memref_ty}) -> ()")).unwrap(),
-            );
-
-            let decl = melior::ir::operation::OperationBuilder::new("func.func", self.loc())
-                .add_attributes(&[
-                    (
-                        melior::ir::Identifier::new(self.context, "sym_name"),
-                        melior::ir::attribute::StringAttribute::new(self.context, &func_name)
-                            .into(),
-                    ),
-                    (
-                        melior::ir::Identifier::new(self.context, "function_type"),
-                        func_ty.into(),
-                    ),
-                    (
-                        melior::ir::Identifier::new(self.context, "sym_visibility"),
-                        melior::ir::attribute::StringAttribute::new(self.context, "private").into(),
-                    ),
-                ])
-                .add_regions([melior::ir::Region::new()])
-                .build()?;
-
-            self.module.body().append_operation(decl);
-        }
-
         // Declare vx_init_signals
         let sig_init_ty = melior::ir::r#type::FunctionType::new(self.context, &[], &[]);
         let sig_init_decl = melior::ir::operation::OperationBuilder::new("func.func", self.loc())
@@ -1088,10 +1128,12 @@ impl<'c> MeliorGenerator<'c> {
                 operations.push(self.generate_function(func)?);
             }
         }
+        let imported = operations.len();
 
         for func in &program.functions {
             operations.push(self.generate_function(func)?);
         }
+        let (operations, referenced) = keep_reached_functions(operations, imported);
 
         let body = self.module.body();
 
@@ -1112,6 +1154,11 @@ impl<'c> MeliorGenerator<'c> {
         for ext in &unique_externs {
             let name = &ext.name;
             if name.as_ref() == "printf" || **name == *"vx_internal_printf" {
+                continue;
+            }
+            // An imported module's extern is declared only when a function calls it.
+            let own = program.externs.iter().any(|e| e.name == *name);
+            if !own && !referenced.contains(name.as_ref()) {
                 continue;
             }
             let (ret_ty, arg_tys) = self.functions.get(name).ok_or_else(|| {
@@ -1176,6 +1223,7 @@ impl<'c> MeliorGenerator<'c> {
         self.allocs.clear();
         self.subspace_offsets.clear(); // per-function sub-space bump allocator (SS2)
         self.pointer_taken = syntax::locals_with_pointer_taken(&func.body);
+        self.address_taken = syntax::locals_with_address_taken(&func.body);
         let is_main = func.name.as_ref() == "main";
         let true_ret_ty = self.lower_type(&func.return_type)?;
         let ret_ty = if is_main { self.i32_ty } else { true_ret_ty };
@@ -1222,8 +1270,6 @@ impl<'c> MeliorGenerator<'c> {
             crate::codegen::lower::LowerError::from("No first operation".to_string())
         })?;
         let func_loc = dummy_op.location();
-
-        let _region = Region::new();
 
         let mut block_args = Vec::new();
         for ty in &arg_tys {
@@ -1827,6 +1873,9 @@ impl<'c> MeliorGenerator<'c> {
         for position in 0..arity {
             let mut payload_ty_str = "none".to_string();
             let mut widest = 0u32;
+            // Numbers of different kinds, such as `i32` and `f32`, share an integer slot. A float
+            // goes in as its bits; an integer in a float slot could read back as a denormal.
+            let mut scalars: Vec<String> = Vec::new();
             for (_v_name, payload) in enum_def {
                 let Some(types) = payload else { continue };
                 let Some(ty) = types.get(position) else {
@@ -1851,6 +1900,9 @@ impl<'c> MeliorGenerator<'c> {
                          generator"
                     )));
                 }
+                if scalar_type_bits(&lowered).is_some() && !scalars.contains(&lowered) {
+                    scalars.push(lowered.clone());
+                }
                 match scalar_type_bits(&lowered) {
                     Some(b) if b > widest => {
                         widest = b;
@@ -1859,6 +1911,9 @@ impl<'c> MeliorGenerator<'c> {
                     None if payload_ty_str == "none" => payload_ty_str = lowered,
                     _ => {}
                 }
+            }
+            if scalars.len() > 1 && scalars.iter().any(|t| is_float_text(t)) {
+                payload_ty_str = format!("i{widest}");
             }
             slots.push(payload_ty_str);
         }
@@ -1883,7 +1938,6 @@ impl<'c> MeliorGenerator<'c> {
         })
     }
 
-    /// An instantiated generic enum (its name holds `<...>`): a tag and the payload slot.
     /// The `vx.placed` mark of a placed parameter or result. A placement written as a device
     /// holds that device's memory; on-chip memory, by the address space its type is given, is
     /// scratch nothing frees.
@@ -2284,6 +2338,13 @@ impl<'c> MeliorGenerator<'c> {
                 is_mut: b.is_mut,
                 region_id: syntax::REGION_UNSET as usize,
             }),
+            // A generic struct's literal does not spell its type arguments, so only a plain
+            // struct is known from the literal alone.
+            Expr::StructInit(s) => self
+                .structs
+                .get(&s.name)
+                .filter(|decl| decl.generics.is_empty())
+                .map(|_| syntax::Type::Struct(s.name.clone(), s.type_id)),
             Expr::Identifier(id) => self.ast_env.get(&id.name).cloned().or_else(|| {
                 // A bare function name used as a *value* (`let f = probe`) is a function pointer;
                 // recover its signature from the function registry so a later indirect call `f(..)`

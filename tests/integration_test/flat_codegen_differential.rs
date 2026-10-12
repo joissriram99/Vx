@@ -246,6 +246,7 @@ fn flat_llvm(src: &str) -> Option<String> {
         &alias_tables,
         &[],
         &[],
+        &[],
         vxc::config::Schedule::Parallel,
     )
     .ok()?;
@@ -344,6 +345,7 @@ fn flat_module_mlir(src: &str) -> Option<String> {
         &agg_layouts,
         &alias_tables,
         &subspaces,
+        &[],
         &[],
         vxc::config::Schedule::Parallel,
     )
@@ -1372,6 +1374,167 @@ fn flat_matches_ast_tensor_reduce() {
     );
 }
 
+fn assert_enum_layout_declines(src: &str) {
+    let mut program = parse(src);
+    program.module_path = "crate::diff".into();
+    let mut mods = vec![program];
+    let symbol_map = vxc::resolver::build_symbol_map(&mods);
+    mods[0].resolve_names(&symbol_map, &[]);
+    let registry = vxc::pipeline::build_frozen_registry(&mods).expect("registry builds");
+    let session = std::sync::Arc::new(GlobalSession::with_registry(1, registry));
+    let env_mods = mods.clone();
+    let env = GlobalAstEnv::build(&env_mods);
+    let mut worker = LocalWorkerState::new(session);
+    {
+        let mut checker = TypeChecker::new(&env, &mut worker);
+        for function in &mut mods[0].functions {
+            checker.check_function(function);
+        }
+        assert_eq!(checker.errors.error_count(), 0, "fixture must type-check");
+    }
+    let main = mods[0]
+        .functions
+        .iter()
+        .find(|function| function.name.as_ref() == "main")
+        .expect("fixture has main");
+    assert_eq!(
+        lower_function_to_hir(main, &mut worker),
+        Err(vxc::decline::Decline::TypeNotModelled {
+            what: "an enum with no modelled instance layout",
+        }),
+        "the unsupported payload must decline during layout resolution"
+    );
+}
+
+#[test]
+fn flat_declines_an_enum_with_an_unsupported_nested_payload() {
+    // Lower the code but don't run it: without the fix, the store of `Inner` would write
+    // past the end of `Outer`.
+    assert_enum_layout_declines(
+        "enum Inner { Value(i64), Empty }\n\
+         enum Outer { Number(i32), Nested(Inner) }\n\
+         fn main() -> i32 { \
+           let _value = Outer::Nested(Inner::Value(9223372036854775807i64)); \
+           return 0; }",
+    );
+}
+
+#[test]
+fn flat_declines_an_enum_with_an_unsupported_first_variant() {
+    // Even constructing the supported variant must reject the incomplete enum layout.
+    assert_enum_layout_declines(
+        "enum Inner { Value(i64), Empty }\n\
+         enum Outer { Nested(Inner), Number(i32) }\n\
+         fn main() -> i32 { let _value = Outer::Number(7); return 0; }",
+    );
+}
+
+#[test]
+fn flat_declines_an_enum_with_an_unsupported_second_payload() {
+    assert_enum_layout_declines(
+        "enum Inner { Value(i64), Empty }\n\
+         enum Outer { Numbers(i32, i32), Nested(i32, Inner) }\n\
+         fn main() -> i32 { let _value = Outer::Numbers(3, 7); return 0; }",
+    );
+}
+
+#[test]
+fn flat_declines_an_enum_with_an_unsupported_second_payload_in_the_first_variant() {
+    assert_enum_layout_declines(
+        "enum Inner { Value(i64), Empty }\n\
+         enum Outer { Nested(i32, Inner), Numbers(i32, i32) }\n\
+         fn main() -> i32 { let _value = Outer::Numbers(3, 7); return 0; }",
+    );
+}
+
+#[test]
+fn flat_declines_an_enum_with_an_unsupported_generic_payload() {
+    assert_enum_layout_declines(
+        "enum Inner { Value(i64), Empty }\n\
+         enum Outer<T> { Number(i32), Nested(T) }\n\
+         fn main() -> i32 { let _value = Outer<Inner>::Number(7); return 0; }",
+    );
+}
+
+fn assert_enum_layout_falls_back(jobs: Option<usize>) {
+    use melior::ir::operation::OperationLike;
+
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let path = dir.path().join("nested_enum.vx");
+    std::fs::write(
+        &path,
+        "enum Inner { Value(i64), Empty }\n\
+         enum Outer { Number(i32), Nested(Inner) }\n\
+         fn main() -> i32 { \
+           let _value = Outer::Nested(Inner::Value(9223372036854775807i64)); \
+           return 0; }",
+    )
+    .expect("write fixture");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vxc"));
+    command
+        .arg(&path)
+        .arg("--emit-mlir")
+        .env("VX_FLAT_DBG", "1");
+    if let Some(jobs) = jobs {
+        command.arg("-j").arg(jobs.to_string());
+    }
+    // Stop before execution: a broken guard could generate an out-of-bounds store.
+    let output = command.output().expect("run compiler");
+    let log = String::from_utf8_lossy(&output.stderr);
+    let context = make_context();
+    let valid_mlir = melior::ir::Module::parse(&context, &String::from_utf8_lossy(&output.stdout))
+        .is_some_and(|module| module.as_operation().verify());
+    let decline = "[flat-codegen] declined main: an enum with no modelled instance layout \
+                   [type-not-modelled(an enum with no modelled instance layout)]";
+    assert_eq!(
+        (
+            output.status.success(),
+            log.contains(decline),
+            log.contains("[flat-codegen] program outside the flat subset; using the AST path"),
+            log.contains("emitted module via the flat path"),
+            jobs.is_none()
+                || log.contains("[parallel-frontend] the flat emitter did not take this program; using the sequential driver"),
+            valid_mlir,
+        ),
+        (true, true, true, false, true, true),
+        "compilation with jobs={jobs:?}: flags are (success, layout decline, AST fallback, \
+         flat module, parallel fallback, valid MLIR)\n{log}\nMLIR:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn driver_falls_back_for_an_unsupported_enum_layout() {
+    assert_enum_layout_falls_back(None);
+}
+
+#[test]
+fn parallel_driver_falls_back_for_an_unsupported_enum_layout() {
+    if std::thread::available_parallelism().map_or(0, usize::from) < 4 {
+        eprintln!("two-worker compilation requires leaving two CPU cores idle");
+        return;
+    }
+    assert_enum_layout_falls_back(Some(2));
+}
+
+#[test]
+fn flat_runs_an_enum_with_absent_payload_positions() {
+    // Empty has no payloads and Single has no second payload; neither prevents a layout.
+    assert_flat_exit(
+        "enum Values { Empty, Single(i32), Pair(i32, i32) }\n\
+         fn read(value : Values) -> i32 {\n\
+           match value {\n\
+             Values::Empty() => { return 1; }\n\
+             Values::Single(n) => { return n; }\n\
+             Values::Pair(a, b) => { return a + b; }\n\
+           } return 0;\n\
+         }\n\
+         fn main() -> i32 { return read(Values::Empty()) + \
+           read(Values::Single(7)) + read(Values::Pair(14, 20)); }",
+        42,
+    );
+}
+
 #[test]
 fn flat_runs_a_data_enum_without_generics() {
     // `Result { Ok(i32), Err(i32) }` is the enum instance with no arguments: constructed,
@@ -2041,6 +2204,7 @@ fn program_links_a_function_body_from_a_vxlib_artifact() {
         &[],
         &[],
         &[],
+        &[],
         vxc::config::Schedule::Parallel,
     )
     .expect("flat codegen emits the linked module");
@@ -2190,6 +2354,133 @@ fn driver_link_interface_runs_a_scalar_import() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An enum a library declares, passed between the library's functions by a program that imports
+/// it: `pick` returns one and `number` matches on it. The program cannot compile at all unless the
+/// `.vxlib` says what `Color` is. That each variant keeps its number is checked in
+/// `registry_interface_round_trips_enum_variants`, since here both ends run the library's code.
+#[test]
+fn driver_link_interface_runs_an_imported_enum() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("vx_link_enum_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (lib, app, vxlib) = (
+        dir.join("colors.vx"),
+        dir.join("app.vx"),
+        dir.join("colors.vxlib"),
+    );
+    std::fs::write(
+        &lib,
+        "enum Color { Red, Green, Blue }\n\
+         fn pick(k : i32) -> Color { if k == 0 { return Color::Red; } \
+           if k == 1 { return Color::Green; } return Color::Blue; }\n\
+         fn number(c : Color) -> i32 { match c { Color::Red => { return 10; } \
+           Color::Green => { return 20; } Color::Blue => { return 30; } } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &app,
+        "fn main() -> i32 { let c = pick(2); print(number(pick(0))); print!(\" \"); \
+           print(number(pick(1))); print!(\" \"); print(number(c)); print!(\"\\n\"); return 0; }\n",
+    )
+    .unwrap();
+
+    let vxc = env!("CARGO_BIN_EXE_vxc");
+    let emit = Command::new(vxc)
+        .args([
+            "--emit-interface",
+            lib.to_str().unwrap(),
+            "-o",
+            vxlib.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run vxc --emit-interface");
+    assert!(
+        emit.status.success(),
+        "emit-interface failed:\n{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+
+    let run = Command::new(vxc)
+        .args([
+            "--link-interface",
+            vxlib.to_str().unwrap(),
+            app.to_str().unwrap(),
+            "--run",
+        ])
+        .output()
+        .expect("run vxc --link-interface --run");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        out.lines().any(|l| l == "10 20 30"),
+        "expected the imported enum to print 10 20 30, got:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A number literal inside a library takes its type from the type checker, as it does in a
+/// program: `b == 32` with `b : u8` compares two `u8`s. A library saved without being checked
+/// kept the literal as an `i32`, and the program that called `is_space` failed to compile.
+#[test]
+fn driver_link_interface_runs_a_library_with_a_u8_literal() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("vx_link_u8_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (lib, app, vxlib) = (
+        dir.join("bytes.vx"),
+        dir.join("app.vx"),
+        dir.join("bytes.vxlib"),
+    );
+    std::fs::write(&lib, "fn is_space(b : u8) -> bool { return b == 32; }\n").unwrap();
+    std::fs::write(
+        &app,
+        "fn main() -> i32 { if is_space(32) { print!(\"space\\n\"); } \
+           if is_space(33) { print!(\"wrong\\n\"); } return 0; }\n",
+    )
+    .unwrap();
+
+    let vxc = env!("CARGO_BIN_EXE_vxc");
+    let emit = Command::new(vxc)
+        .args([
+            "--emit-interface",
+            lib.to_str().unwrap(),
+            "-o",
+            vxlib.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run vxc --emit-interface");
+    assert!(
+        emit.status.success(),
+        "emit-interface failed:\n{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+
+    let run = Command::new(vxc)
+        .args([
+            "--link-interface",
+            vxlib.to_str().unwrap(),
+            app.to_str().unwrap(),
+            "--run",
+        ])
+        .output()
+        .expect("run vxc --link-interface --run");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        out.lines().any(|l| l == "space") && !out.contains("wrong"),
+        "expected is_space(32) to be true and is_space(33) false, got:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The AST codegen cannot link a `--link-interface` import (it has no AST for the imported function),
 /// so a consumer whose body falls outside the flat subset must fail with a **clean diagnostic** — the
 /// frontend check (incl. cross-module provenance) still passes, only codegen is blocked. Regression
@@ -2256,6 +2547,70 @@ fn driver_link_interface_declines_cleanly_outside_flat_subset() {
     assert!(
         !out.contains("Internal Error") && !out.contains("panicked"),
         "must be a clean error, not an ICE, got:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A library function that calls another function of the same library: the program names only
+/// `answer`, and `is_square` and `square` have to be linked from the `.vxlib` as well, or the link
+/// fails with an undefined reference.
+#[test]
+fn driver_link_interface_links_what_a_library_function_calls() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("vx_link_callee_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (lib, app, vxlib) = (
+        dir.join("squares.vx"),
+        dir.join("app.vx"),
+        dir.join("squares.vxlib"),
+    );
+    std::fs::write(
+        &lib,
+        "fn square(x : i32) -> i32 { return x * x; }\n\
+         fn is_square(n : i32, root : i32) -> bool { return square(root) == n; }\n\
+         fn answer() -> i32 { if is_square(49, 7) { return 1; } return 0; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &app,
+        "fn main() -> i32 { print(answer()); print!(\"\\n\"); return 0; }\n",
+    )
+    .unwrap();
+
+    let vxc = env!("CARGO_BIN_EXE_vxc");
+    let emit = Command::new(vxc)
+        .args([
+            "--emit-interface",
+            lib.to_str().unwrap(),
+            "-o",
+            vxlib.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run vxc --emit-interface");
+    assert!(
+        emit.status.success(),
+        "emit-interface failed:\n{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+
+    let run = Command::new(vxc)
+        .args([
+            "--link-interface",
+            vxlib.to_str().unwrap(),
+            app.to_str().unwrap(),
+            "--run",
+        ])
+        .output()
+        .expect("run vxc --link-interface --run");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        out.lines().any(|l| l == "1"),
+        "expected answer() to print 1, got:\n{out}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

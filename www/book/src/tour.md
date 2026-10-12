@@ -256,6 +256,22 @@ fn matmul(a : Tensor<f32, [?, ?]>, b : Tensor<f32, [?, ?]>) -> Tensor<f32, [?, ?
 `.extent(n)` reads the size of dimension `n`. Shapes that *are* known statically get checked
 statically — a matmul whose inner dimensions disagree is a compile error rather than a runtime one.
 
+`m[i]` is row `i`, and a row has the size of the last dimension: for a `[2, 3]` tensor, `m[0][j]`
+needs `j < 3` and does not reach into the next row. An index the compiler can see is too large,
+such as `m[0][5]` or `m[0][j]` inside `for j in 0..6`, is a compile error. To walk all the
+elements in one loop, `.reshape` the tensor to one dimension.
+
+`.reshape(shape)` gives the same elements in a new shape, without copying them. `.pad(shape)` makes
+a larger tensor with zeros after each axis, which is how a matrix is rounded up to a tile size:
+
+```rust
+let m : Tensor<f32, [30, 30]> = Tensor<f32, [30, 30]>::fill(1.0);
+let tiled : Tensor<f32, [32, 32]> = m.pad([32, 32]);   // m[i][j] is tiled[i][j]
+let row : Tensor<f32, [900]> = m.reshape([900]);
+```
+
+The language reference lists the other forms, which keep or drop elements in row order.
+
 ## Collections
 
 The standard library ships the usual containers. `Vec<T>` is a growable array:

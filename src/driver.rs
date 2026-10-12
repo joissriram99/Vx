@@ -16,7 +16,7 @@ use crate::syntax_printer::AstPrinter;
 use clap::{Parser, ValueEnum};
 use codegen::MeliorGenerator;
 use melior::ir::operation::OperationLike;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Schedule;
 
@@ -103,6 +103,12 @@ pub struct DriverOptions {
     /// file and the program both declare is an error (E6012), never a silent shadow (#281).
     #[arg(long = "machine", value_name = "FILE")]
     pub machine: Option<PathBuf>,
+
+    /// Import a package by name: with `--package textkit=../textkit`, `import textkit::runs`
+    /// reads `../textkit/runs.vx`. The stdlib paths stay as they are, and only `dir` is read for
+    /// imports that start with `name`. Can be given more than once.
+    #[arg(long = "package", value_name = "NAME=DIR", value_parser = parse_package)]
+    pub packages: Vec<(String, PathBuf)>,
 
     /// The host the program runs on: a file declaring `Memory::CPU_DRAM`, or
     /// `default` for the machine compiling it.
@@ -214,6 +220,28 @@ pub struct DriverOptions {
     /// Arguments to pass to the running program
     #[arg(last = true)]
     pub program_args: Vec<String>,
+}
+
+/// `name=dir` for `--package`.
+fn parse_package(arg: &str) -> Result<(String, PathBuf), String> {
+    let Some((name, dir)) = arg.split_once('=') else {
+        return Err(format!("expected NAME=DIR, got `{arg}`"));
+    };
+    let is_name = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !is_name {
+        return Err(format!("`{name}` is not a package name"));
+    }
+    if name == "std" {
+        return Err("`std` is the standard library and cannot be a package".to_string());
+    }
+    if !Path::new(dir).is_dir() {
+        return Err(format!("`{dir}` is not a directory"));
+    }
+    Ok((name.to_string(), PathBuf::from(dir)))
 }
 
 pub struct CompilerDriver {
@@ -434,9 +462,16 @@ impl CompilerDriver {
             // Only the file the user named reports its diagnostics, matching what the
             // sequential driver keeps from its own import pass.
             let reported = crate::pipeline::Reported::OnlyEntry(filename.into());
+            // A failed check ends with the line the sequential driver prints, with the file.
             let text =
                 crate::pipeline::compile_modules_mlir_in(programs, sched, intern_mode, reported)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| match e {
+                        crate::pipeline::PipelineError::Failed { count, .. } => format!(
+                            "Semantic check failed on '{}': {} error(s) emitted",
+                            filename, count
+                        ),
+                        other => other.to_string(),
+                    })?;
             let Some(text) = text else {
                 // Worded so it cannot be mistaken for the flat emitter's own decline, which
                 // `flat_corpus_sweep` classifies a program by: the two say different things
@@ -524,7 +559,7 @@ impl CompilerDriver {
         }
         roots.push(filename.to_string());
 
-        let mut loader = ModuleLoader::new();
+        let mut loader = self.module_loader();
         // The error names the file it happened in -- an import deep in a wave, or the --machine
         // or --host file, none of which is the entry module. Naming the entry file here pointed
         // at a file that parsed cleanly, and left the real one to be read out of the nested
@@ -562,11 +597,9 @@ impl CompilerDriver {
         }
 
         if self.options.action == Action::RunJit {
-            let mut args = vec![self.options.inputs[0].to_string_lossy().into_owned()];
-            args.extend(self.options.program_args.clone());
             let out = crate::jit::execute_mlir_streams(
                 &mlir_src,
-                args,
+                self.options.program_args.clone(),
                 self.options.opt_level,
                 self.options.disable_llvm_optimizations,
             )
@@ -596,10 +629,6 @@ impl CompilerDriver {
             return self.handle_parse_only(&program_arr, filename);
         }
 
-        if self.options.action == Action::EmitInterface {
-            return self.handle_emit_interface(&mut program_arr, filename);
-        }
-
         // Interfaces to merge into the registry: `.vxlib` imports auto-loaded above, plus an explicit
         // `--link-interface`. Both the frontend session and the flat codegen consume this set (#219).
         let interfaces = self.all_interface_bytes(auto_interfaces)?;
@@ -607,6 +636,16 @@ impl CompilerDriver {
         let (mut main_ast, mut other_asts) =
             self.prepare_semantic_analysis(&mut program_arr, filename)?;
         self.run_semantic_analysis(&mut main_ast, &mut other_asts, filename, &interfaces)?;
+
+        // A library is type-checked before it is saved: a number literal takes its type from
+        // the checker, and a library with a type error is refused rather than written.
+        if self.options.action == Action::EmitInterface {
+            let mut others: Vec<_> = other_asts.into_values().collect();
+            others.sort_by(|a, b| a.module_path.cmp(&b.module_path));
+            let mut mods = vec![main_ast];
+            mods.extend(others);
+            return self.handle_emit_interface(&mut mods, filename);
+        }
 
         if self.options.action == Action::PrintAst {
             AstPrinter::print_program(&main_ast, &mut std::io::stdout()).unwrap();
@@ -623,6 +662,15 @@ impl CompilerDriver {
         )
     }
 
+    /// A loader that reads the `--package` directories.
+    fn module_loader(&self) -> ModuleLoader {
+        let mut loader = ModuleLoader::new();
+        for (name, dir) in &self.options.packages {
+            loader.add_package(name, dir);
+        }
+        loader
+    }
+
     /// Load + macro-expand the entry module and its imports. Returns the parsed modules plus the
     /// serialized interface bytes of any import that resolved to a precompiled `.vxlib` (#219) — those
     /// modules are never parsed; their interfaces are merged into the registry instead.
@@ -630,7 +678,7 @@ impl CompilerDriver {
         &self,
         filename: &str,
     ) -> Result<(Vec<crate::syntax::Program>, Vec<Vec<u8>>), String> {
-        let mut loader = ModuleLoader::new();
+        let mut loader = self.module_loader();
         // The machine model loads first, so its declarations are in the unit before the program's
         // own module. It is a peer module, not an import: the program never names it, which is the
         // point -- the same program text is admitted against a different SKU by swapping the flag
@@ -690,6 +738,7 @@ impl CompilerDriver {
                 return Err(format!("Macro expansion failed: {}", e));
             }
         }
+        crate::resolver::fold_const_extents(&mut program_arr);
         Ok((program_arr, auto_interfaces))
     }
 
@@ -927,7 +976,21 @@ impl CompilerDriver {
         // Everything that is about the program as a whole rather than one function, before any
         // body is checked. Shared with the parallel pipeline so the two frontends cannot drift.
         checker.check_whole_program_declarations();
+        // Found before the checks rename calls to generic instances, reported after them.
+        let mut unused_functions = crate::diagnostic::DiagnosticsVec::new();
+        crate::hir::check::unused_functions::warn_functions_nothing_calls(
+            ast,
+            &mut unused_functions,
+        );
 
+        // Taken before checking: a comptime function without parameters has its block folded
+        // in place, after which its body no longer looks like one.
+        let comptime_fns: std::collections::HashSet<crate::symbol::Symbol> = ast
+            .functions
+            .iter()
+            .filter(|f| crate::hir::TypeChecker::is_comptime_fn(f))
+            .map(|f| f.name.clone())
+            .collect();
         for f in &mut ast.functions {
             checker.check_function(f);
         }
@@ -1051,6 +1114,10 @@ impl CompilerDriver {
             .errors
             .iter()
             .any(|d| d.level == DiagnosticLevel::Error);
+        // A program with a type error is unfinished, and the error is what it needs to hear.
+        if !has_errors {
+            checker.errors.inner.extend(unused_functions.inner);
+        }
 
         // The machine-readable verdict, before the human-readable rendering below: one record on
         // stdout carrying every diagnostic plus the resolved staging routes, so an admission
@@ -1127,6 +1194,10 @@ impl CompilerDriver {
             .filter(|f| !crate::hir::TypeChecker::is_comptime_lambda_body(f))
             .collect();
         new_functions.extend(orig_functions);
+        // Every call to a comptime function has folded, so it is never emitted.
+        new_functions.retain(|f| {
+            !comptime_fns.contains(&f.name) && !crate::hir::TypeChecker::is_comptime_fn(f)
+        });
         ast.functions = new_functions;
         ast.structs.extend(checker.mono.generated_structs);
 
@@ -1406,11 +1477,9 @@ impl CompilerDriver {
             }
             Action::RunJit => {
                 let mlir_str = format!("{}", module.as_operation());
-                let mut args = vec![self.options.inputs[0].to_string_lossy().into_owned()];
-                args.extend(self.options.program_args.clone());
                 let out = crate::jit::execute_mlir_streams(
                     &mlir_str,
-                    args,
+                    self.options.program_args.clone(),
                     self.options.opt_level,
                     self.options.disable_llvm_optimizations,
                 )
@@ -1504,6 +1573,7 @@ impl CompilerDriver {
         // path emits (otherwise dropped on the default path).
         let subspaces: Vec<crate::codegen::flat::SubspaceInfo>;
         let topo_archs: Vec<(i64, String)>;
+        let local_devices: Vec<(i32, i32)>;
         {
             let env_mods = mods.clone();
             let env = GlobalAstEnv::build(&env_mods);
@@ -1516,6 +1586,7 @@ impl CompilerDriver {
             }
             subspaces = crate::codegen::flat::subspaces_from_env(&env);
             topo_archs = crate::codegen::flat::topo_archs_from_env(&env);
+            local_devices = crate::codegen::flat::local_devices_from_env(&env);
         }
 
         // Index every non-generic function by name (the main-module version wins any collision).
@@ -1593,16 +1664,34 @@ impl CompilerDriver {
             Vec<crate::bytecode::HirInstruction>,
             Vec<crate::gid::TypeId>,
         )> = Vec::new();
-        for name in &lowered_names {
-            if fn_map.contains_key(name) {
+        // A library function's own calls are followed too: their bodies are in the interface as
+        // well, and nothing in this compile names them.
+        let mut pending: std::collections::VecDeque<crate::gid::TypeId> = lowered_names
+            .iter()
+            .filter(|name| !fn_map.contains_key(*name))
+            .filter_map(|name| session.registry.fn_sigs.get(name).map(|sig| sig.gid))
+            .collect();
+        let mut linked = std::collections::HashSet::new();
+        while let Some(gid) = pending.pop_front() {
+            if !linked.insert(gid) {
                 continue;
             }
-            let Some(sig) = session.registry.fn_sigs.get(name) else {
+            let Some(body) = session.registry.body_of(gid) else {
                 continue;
             };
-            let Some(body) = session.registry.body_of(sig.gid) else {
+            if fn_map.contains_key(&body.name) {
                 continue;
-            };
+            }
+            for ins in &body.hir {
+                if matches!(
+                    ins.opcode,
+                    crate::bytecode::Opcode::Call | crate::bytecode::Opcode::FuncConst
+                ) {
+                    if let Some(callee) = body.types.get(ins.type_idx.0 as usize) {
+                        pending.push_back(*callee);
+                    }
+                }
+            }
             let synth = crate::syntax::Function {
                 is_unsafe: false,
                 name: body.name.clone(),
@@ -1678,6 +1767,7 @@ impl CompilerDriver {
             &alias_tables,
             &subspaces,
             &topo_archs,
+            &local_devices,
             crate::config::Schedule::Parallel,
         ) {
             Ok(t) => t,

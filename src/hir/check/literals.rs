@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // One expression family's type checks, split out of the former 5000-line `hir/expr.rs` along the
-// `check_expr_type_flag` dispatch seam (frontend_refactoring_borrow_checker.md R2, #279). An additional
+// `check_expr_type_flag` dispatch seam. An additional
 // `impl TypeChecker` block; moves only, zero logic change. Reaches the shared types and helpers via
 // `use super::super::*`, exactly as `expr.rs` uses `use super::*`.
 //
@@ -43,10 +43,13 @@ impl<'a> TypeChecker<'a> {
 
     /// A bare name that is not a declared nominal is a generic parameter still in scope, not a
     /// struct: `Option<T>::Some(v: T)` has to match its own `Generic("T")` payload (#242).
+    /// `void` is built in, so it is never declared, and stays `void`.
     fn as_scoped_generic(&self, ty: Type) -> Type {
         match ty {
             Type::Struct(name, None)
-                if !self.env.structs.contains_key(&name) && !self.env.enums.contains_key(&name) =>
+                if !self.env.structs.contains_key(&name)
+                    && !self.env.enums.contains_key(&name)
+                    && !crate::syntax::is_void_ty(&Type::Struct(name.clone(), None)) =>
             {
                 Type::Generic(name, None)
             }
@@ -72,7 +75,20 @@ impl<'a> TypeChecker<'a> {
                     if let Some((_, expected_payload)) =
                         enum_decl.variants.iter().find(|(n, _)| n == variant)
                     {
-                        if let Some(expr_payload) = payload {
+                        // `Result<void, E>::Ok()`: a payload whose type is `void` here takes no
+                        // argument, as Rust's `Ok(())` holds nothing.
+                        let void_payload = expected_payload.as_ref().is_some_and(|exp_types| {
+                            let mut mapping = HashMap::new();
+                            let ty_args = self.enum_name_type_args(enum_name);
+                            for (param, ty_arg) in enum_decl.generics.iter().zip(ty_args.iter()) {
+                                mapping.insert(param.name().into(), ty_arg.clone());
+                            }
+                            exp_types.len() == 1
+                                && crate::syntax::is_void_ty(&exp_types[0].substitute(&mapping))
+                        });
+                        if void_payload && payload.as_ref().is_none_or(|p| p.is_empty()) {
+                            // Nothing to check.
+                        } else if let Some(expr_payload) = payload {
                             if let Some(exp_types) = expected_payload {
                                 if expr_payload.len() != exp_types.len() {
                                     if !self.speculating {
@@ -467,9 +483,21 @@ impl<'a> TypeChecker<'a> {
                 // `tensor.from_elements`. So the restriction is on non-scalar VALUES -- a
                 // tensor variable -- not on nested literals, which stay legal.
                 let nested = matches!(elements.first(), Some(Expr::Array(_)));
+                // The element type comes from the first element that is not a bare number
+                // literal, so `[1.0, d]` takes `d`'s type. That element is checked first.
+                let lead = if nested {
+                    0
+                } else {
+                    elements
+                        .iter()
+                        .position(|e| !crate::hir::expr::is_untyped_numeric_literal(e))
+                        .unwrap_or(0)
+                };
+                let order = std::iter::once(lead).chain((0..elements.len()).filter(|&i| i != lead));
                 let mut elem_ty = ElementType::F32;
-                for (i, el) in elements.iter_mut().enumerate() {
-                    if i == 0 {
+                for i in order {
+                    let el = &mut elements[i];
+                    if i == lead {
                         let first = self.check_expr_type(el);
                         match (first, nested) {
                             (Type::Scalar(e), false) => elem_ty = e,
@@ -507,7 +535,23 @@ impl<'a> TypeChecker<'a> {
                         }
                         self.check_expr_type(el);
                     } else {
-                        self.check_expr_expecting(el, Some(Type::Scalar(elem_ty.clone())), true);
+                        let ty = self.check_expr_expecting(
+                            el,
+                            Some(Type::Scalar(elem_ty.clone())),
+                            true,
+                        );
+                        if let Type::Scalar(e) = &ty {
+                            if *e != elem_ty {
+                                self.errors.error_with_code(
+                                    crate::diagnostic::DiagnosticCode::E3018,
+                                    format!(
+                                        "this array literal's elements are {elem_ty}, but one is {e}; \
+                                         convert it with `as {elem_ty}`"
+                                    ),
+                                    Some(crate::diagnostic::SourceSpan::from_ast_span(&el.span())),
+                                );
+                            }
+                        }
                     }
                 }
                 // A literal knows its shape: `[1, 2, 3]` is `Tensor<i32, [3]>`, and
@@ -801,8 +845,10 @@ impl<'a> TypeChecker<'a> {
                 let ret_expr =
                     Expr::Identifier(IdentifierExpr::new(var_name.clone().into(), *span));
 
-                let block =
-                    Expr::UnsafeBlock(UnsafeBlockExpr::new(stmts, Some(Box::new(ret_expr)), *span));
+                let block = Expr::UnsafeBlock(UnsafeBlockExpr {
+                    generated: true,
+                    ..UnsafeBlockExpr::new(stmts, Some(Box::new(ret_expr)), *span)
+                });
 
                 *expr = block;
                 self.check_expr_type(expr)

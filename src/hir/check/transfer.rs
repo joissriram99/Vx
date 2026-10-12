@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // One expression family's type checks, split out of the former 5000-line `hir/expr.rs` along the
-// `check_expr_type_flag` dispatch seam (frontend_refactoring_borrow_checker.md R2, #279). An additional
+// `check_expr_type_flag` dispatch seam. An additional
 // `impl TypeChecker` block; moves only, zero logic change. Reaches the shared types and helpers via
 // `use super::super::*`, exactly as `expr.rs` uses `use super::*`.
 //
@@ -441,6 +441,45 @@ impl<'a> TypeChecker<'a> {
         self.check_capacity_of(elem, dims, space, context, span, true)
     }
 
+    /// E6031: a static shape that folds to a negative extent, or to more bytes than 64 bits hold.
+    /// The size is known and wrong, so it is an error rather than an unverified size (W1029).
+    /// Returns whether the shape was refused.
+    pub(crate) fn refuse_unrepresentable_shape(
+        &mut self,
+        elem: &ElementType,
+        dims: &[Dim],
+        span: &Span,
+    ) -> bool {
+        use crate::hir::memory::StaticSize;
+        let why = match crate::hir::memory::static_tensor_size(elem, dims) {
+            StaticSize::NegativeExtent => "one of its extents is negative",
+            StaticSize::Overflows => "its size in bytes does not fit in 64 bits",
+            StaticSize::Bytes(_) | StaticSize::NotConstant => return false,
+        };
+        // The extents as they fold, so `[N - 2 * N]` shows the number it comes to.
+        let extents = dims
+            .iter()
+            .map(|d| match crate::hir::memory::static_extent(d) {
+                Some(v) => v.to_string(),
+                None => "?".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!("`Tensor<{elem}, [{extents}]>` cannot be allocated: {why}");
+        // One tensor is checked where it is made and again at each transfer; say it once.
+        let said = self.errors.inner.iter().any(|d| {
+            d.code == Some(crate::diagnostic::DiagnosticCode::E6031) && d.message == message
+        });
+        if !self.speculating && !said {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E6031,
+                message,
+                Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+            );
+        }
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn check_capacity_of(
         &mut self,
@@ -451,6 +490,9 @@ impl<'a> TypeChecker<'a> {
         span: &Span,
         record: bool,
     ) {
+        if self.refuse_unrepresentable_shape(elem, dims, span) {
+            return;
+        }
         let sized = {
             let h = crate::hir::memory::MemoryHierarchy::build(self.env.memories.values().copied());
             let Some(decl) = h.descriptor(space) else {
@@ -1776,6 +1818,16 @@ impl<'a> TypeChecker<'a> {
             return Type::Unknown;
         };
 
+        if edge.source_mem == edge.target_mem && !self.speculating {
+            self.errors.warn(
+                crate::diagnostic::DiagnosticCode::W1022,
+                format!(
+                    "the value is already in {}; this transfer only makes a copy",
+                    edge.target_mem.name()
+                ),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(&t.span)),
+            );
+        }
         if edge.path.len() > 2 {
             return self.stage_multi_hop(expr, edge, relaxed, consume);
         }
@@ -1969,6 +2021,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub(crate) fn check_spawnon_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
+        let unused = std::mem::replace(&mut self.value_unused, false);
         match expr {
             Expr::SpawnOn(SpawnOnExpr {
                 top,
@@ -1979,6 +2032,15 @@ impl<'a> TypeChecker<'a> {
                 let spawn_span = *span;
                 let mut actual_top = top.clone();
                 if actual_top == Topology::Current {
+                    if !self.speculating {
+                        self.errors.warn(
+                            crate::diagnostic::DiagnosticCode::W1023,
+                            "`spawn on(Topology::Current)` runs the region where the code \
+                             around it already runs, so the `spawn` changes nothing"
+                                .to_string(),
+                            Some(crate::diagnostic::SourceSpan::from_ast_span(&spawn_span)),
+                        );
+                    }
                     actual_top = self.active_topology.clone();
                 }
 
@@ -2099,7 +2161,7 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 self.drops_enter_spawn();
-                self.check_expr_block(stmts, consume);
+                self.check_expr_block(stmts, ret.as_deref(), consume);
                 // Checked once the region's own frame is closed, so a variable from outside that
                 // the region hands out moves in the enclosing function.
                 self.drops_exit_spawn();
@@ -2107,6 +2169,9 @@ impl<'a> TypeChecker<'a> {
                 let mut ret_ty = Type::Struct("void".into(), None); // default void-like type
                 let has_ret = ret.is_some();
                 if let Some(r) = ret {
+                    // The parser reads a trailing `if` as the region's value; a region used as
+                    // a statement does not use it.
+                    self.value_unused = unused;
                     ret_ty = self.check_expr_type_flag(r, consume);
                 }
                 // A variable from outside the region is handed out as the same buffer.

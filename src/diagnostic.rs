@@ -52,33 +52,38 @@ pub enum DiagnosticCode {
     // --- Warnings (W1xxx) ---
     /// Unused variable binding
     W1001,
-    /// Unused function definition
+    /// A function in the program's own file that nothing calls, directly or through other
+    /// functions, starting from `main`.
     W1002,
     /// Unreachable code after return, break, or continue
     W1003,
-    /// Unnecessary mutable binding (`let mut x` where x is never reassigned)
+    /// `let mut x` where `x` never changes: it is never assigned, never borrowed `&mut`, and no
+    /// method that changes it is called on it. The `mut` can go.
     W1004,
-    /// Shadowed variable in same scope
+    /// A `let` that reuses a name already declared in the same block, so the first value can
+    /// no longer be named.
     W1005,
-    /// Redundant borrow (`&&x`)
+    /// `&&x`, a borrow of a borrow, where `&x` was probably meant.
     W1006,
-    /// Implicit type widening in `as` cast
+    /// An `as` cast that widens, such as `x as i64` when `x` is an `i32`. It cannot lose a value,
+    /// and `i64::from(x)` says so.
     W1007,
-    /// Empty match arm body
+    /// A match arm whose body is empty, such as `1 => {}`.
     W1008,
     /// Unused function parameter
     W1009,
-    /// Unnecessary unsafe block (no unsafe ops inside)
+    /// An `unsafe` block with nothing inside it that needs `unsafe`.
     W1010,
-    /// Redundant `as` cast to same type
+    /// An `as` cast to the type the value already has, such as `x as i32` when `x` is an `i32`.
     W1013,
-    /// Narrowing cast loses precision
+    /// An `as` cast of a number known while compiling that does not fit the target type, such
+    /// as `100000 as i8`, which gives -96.
     W1014,
-    /// Immediately dereferenced borrow (`*&x`)
+    /// `*&x`, a borrow that is dereferenced at once. It is the same as `x`.
     W1020,
-    /// Transfer to same memory space (no-op)
+    /// A `transfer` into the memory the value is already in. It only makes a copy.
     W1022,
-    /// Spawn on Topology::Current (no-op)
+    /// `spawn on(Topology::Current)`: the region runs where the code around it already runs.
     W1023,
     /// Implicit cross-topology transfer inserted via a `Relocatable` impl (a real data
     /// movement happens silently at the use site; write the transfer explicitly to
@@ -118,6 +123,11 @@ pub enum DiagnosticCode {
     /// ran and found a violation. Emitted only under `VX_ALLOW_UNVERIFIED`; without it a missing
     /// solver is an error, because silence used to be indistinguishable from success (Vx#374).
     W1031,
+    /// `Tensor<..>::uninit()` called outside an `unsafe` block. Its elements hold whatever the
+    /// memory held before, so reading one before writing it reads data the program never wrote.
+    /// Call it inside `unsafe { .. }` to say that every element is written first, or use `::new()`
+    /// for zeroed storage. A later version makes this an error.
+    W1032,
 
     // --- Parser Errors (E1xxx) ---
     /// Unexpected token
@@ -203,7 +213,8 @@ pub enum DiagnosticCode {
     E3016,
     /// Closure argument count or type mismatch
     E3017,
-    /// An array literal whose elements are not scalars, or which is empty.
+    /// An array literal whose elements are not scalars, are not all of one type, or which is
+    /// empty. A number literal takes the type of the other elements; a typed value needs `as`.
     ///
     /// An array literal lowers to `tensor.from_elements`, whose element type must be a scalar,
     /// so `[a, b]` for tensors -- placed or not -- has nothing to lower to, and an empty
@@ -339,6 +350,19 @@ pub enum DiagnosticCode {
     /// function call returns, or a nested array literal. The loop reads the tensor by index, so
     /// it needs a name: bind the tensor with `let` first.
     E3046,
+    /// A `reshape` call the compiler cannot check: the new shape has a different number of
+    /// elements than the tensor (without `PadMode::Pad` or `PadMode::Trim`), a size is not known
+    /// while compiling, or the arguments are not a shape such as `[4, 4]` and an optional
+    /// `PadMode`.
+    E3047,
+    /// An `if` with no `else` whose value is used, as in `let u = if c { .. };`. When the
+    /// condition is false there is no branch to give a value. Add an `else`, or use the `if`
+    /// as a statement.
+    E3048,
+    /// Two impls of the same trait for the same type: `impl Describe for Point` written twice,
+    /// in one module or in two. A type has one impl of a trait, so a call could not choose
+    /// between them. Remove one.
+    E3049,
 
     // --- Borrow/Ownership Errors (E4xxx) ---
     /// Use of moved or consumed linear variable
@@ -384,6 +408,11 @@ pub enum DiagnosticCode {
     /// value is dropped, so calling it as well would run it twice. Write `drop(x)`, from
     /// `core::mem`, to drop a value early.
     E4012,
+    /// A field moved out of a value that must keep it: `let x = p.a` where `p`'s type
+    /// implements `Drop`, whose `drop` needs every field, or `let x = make().a`, where the
+    /// value has no name and drops all its fields at the end of the statement. Borrow the
+    /// field (`&p.a`), clone it, or bind the value to a variable first.
+    E4013,
 
     // --- Safety Errors (E5xxx) ---
     /// Unsafe function call outside unsafe block
@@ -531,6 +560,9 @@ pub enum DiagnosticCode {
     /// `::uninit()`, with no type annotation, a size that uses nothing the region computes, and
     /// a name nothing outside the region already uses.
     E6030,
+    /// A tensor shape that folds to a negative extent, or whose size in bytes does not fit in 64
+    /// bits. The size is known, and it is not one the generated code can allocate: it would wrap.
+    E6031,
 
     // --- Tensor/Math Errors (E7xxx) ---
     /// Matmul dimension mismatch
@@ -863,7 +895,37 @@ impl DiagnosticsVec {
             .iter()
             .any(|d| d.level == DiagnosticLevel::Error && d.code == Some(code))
     }
+
+    /// Drops each warning added since `start` that is already in `given`, and adds the rest to
+    /// it. Two warnings are the same when their code, position and message are.
+    pub fn drop_warnings_already_given(
+        &mut self,
+        start: usize,
+        given: &mut std::collections::HashSet<WarningKey>,
+    ) {
+        let mut i = start;
+        while i < self.inner.len() {
+            let d = &self.inner[i];
+            if d.level != DiagnosticLevel::Warning {
+                i += 1;
+                continue;
+            }
+            let at = d.source_span.as_ref().map(|s| (s.line, s.column, s.length));
+            if given.insert((d.code, at, d.message.to_string())) {
+                i += 1;
+            } else {
+                self.inner.remove(i);
+            }
+        }
+    }
 }
+
+/// What makes two warnings the same: code, position (line, column, length) and message.
+pub type WarningKey = (
+    Option<DiagnosticCode>,
+    Option<(usize, usize, usize)>,
+    String,
+);
 
 impl IntoIterator for DiagnosticsVec {
     type Item = Diagnostic;

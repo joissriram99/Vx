@@ -318,6 +318,17 @@ impl MethodCallExpr {
             span,
         }
     }
+
+    /// `t.reshape(shape, PadMode::Pad)`: a reshape that makes a new tensor rather than a view.
+    pub fn is_padding_reshape(&self) -> bool {
+        self.method_name.as_ref() == "reshape" && self.args.get(1).is_some_and(is_pad_mode_pad)
+    }
+}
+
+/// Whether `e` is `PadMode::Pad`.
+pub fn is_pad_mode_pad(e: &Expr) -> bool {
+    matches!(e, Expr::EnumVariant(v)
+        if v.enum_name.as_ref() == "PadMode" && v.variant_name.as_ref() == "Pad")
 }
 
 pub trait BinaryOperator {
@@ -465,10 +476,18 @@ pub struct UnsafeBlockExpr {
     pub stmts: Vec<Statement>,
     pub ret: Option<Box<Expr>>,
     pub span: Span,
+    /// The compiler made this block (for `vec![..]`), so W1010 never warns about it or counts it
+    /// as a block around another one.
+    pub generated: bool,
 }
 impl UnsafeBlockExpr {
     pub fn new(stmts: Vec<Statement>, ret: Option<Box<Expr>>, span: Span) -> Self {
-        Self { stmts, ret, span }
+        Self {
+            stmts,
+            ret,
+            span,
+            generated: false,
+        }
     }
 }
 
@@ -633,6 +652,7 @@ pub fn statement_always_exits(stmt: &Statement, never: &dyn Fn(&str) -> bool) ->
                 !arms.is_empty() && arms.iter().all(|a| block_always_exits(&a.body, never))
             }
             Expr::FunctionCall(c) => is_abort_or_panic(c) || never(c.name.as_ref()),
+            Expr::UnsafeBlock(UnsafeBlockExpr { stmts, .. }) => block_always_exits(stmts, never),
             _ => false,
         },
         _ => false,
@@ -680,13 +700,15 @@ pub fn yields_no_value(expr: &Expr) -> bool {
 /// Only the case where *every* path returns counts. A construct where one arm returns and another
 /// yields a value is still a value.
 pub fn diverges_on_every_path(expr: &Expr) -> bool {
-    // A branch may also end in a `match` whose every arm exits; that `match` is a statement too.
+    // A branch may also end in a `match` or an `unsafe` block that exits on every path; that is a
+    // statement too.
     fn block_returns(stmts: &[Statement]) -> bool {
         match stmts.last() {
             Some(Statement::Return(_)) => true,
             Some(last @ Statement::ExprStmt(ExprStmtStmt { expr, .. })) => {
                 diverges_on_every_path(expr)
-                    || (matches!(expr, Expr::Match(_)) && statement_always_exits(last, &|_| false))
+                    || (matches!(expr, Expr::Match(_) | Expr::UnsafeBlock(_))
+                        && statement_always_exits(last, &|_| false))
             }
             _ => false,
         }
@@ -756,6 +778,8 @@ pub enum Pattern {
 pub struct MatchArm {
     pub pattern: Pattern,
     pub body: Vec<Statement>,
+    /// The arm's first token. `Span::default()` for an arm the compiler wrote itself.
+    pub span: Span,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1029,6 +1053,19 @@ pub fn locals_with_pointer_taken(stmts: &[Statement]) -> std::collections::HashS
                 if let Some(root) = matmul_operand_root(&m.base) {
                     names.insert(root.clone());
                 }
+            }
+        }
+    });
+    names
+}
+
+/// The locals in `stmts` whose address is taken with `&x` or `&mut x`.
+pub fn locals_with_address_taken(stmts: &[Statement]) -> std::collections::HashSet<Symbol> {
+    let mut names = std::collections::HashSet::new();
+    visit_exprs(stmts, &mut |e| {
+        if let Expr::Borrow(b) = e {
+            if let Expr::Identifier(id) = &*b.expr {
+                names.insert(id.name.clone());
             }
         }
     });
@@ -1321,6 +1358,7 @@ impl Expr {
                 stmts: e.stmts.iter().map(|s| s.substitute(mapping)).collect(),
                 ret: e.ret.as_ref().map(|r| Box::new(r.substitute(mapping))),
                 span: e.span,
+                generated: e.generated,
             }),
             Expr::StructInit(e) => {
                 let mut new_name = e.name.clone();
@@ -1367,6 +1405,7 @@ impl Expr {
                     .map(|arm| MatchArm {
                         pattern: arm.pattern.clone(), // Patterns don't currently have types to substitute
                         body: arm.body.iter().map(|s| s.substitute(mapping)).collect(),
+                        span: arm.span,
                     })
                     .collect(),
                 span: e.span,

@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // One expression family's type checks, split out of the former 5000-line `hir/expr.rs` along the
-// `check_expr_type_flag` dispatch seam (frontend_refactoring_borrow_checker.md R2, #279). An additional
+// `check_expr_type_flag` dispatch seam. An additional
 // `impl TypeChecker` block; moves only, zero logic change. Reaches the shared types and helpers via
 // `use super::super::*`, exactly as `expr.rs` uses `use super::*`.
 //
@@ -185,6 +185,10 @@ impl<'a> TypeChecker<'a> {
                 ty: None,
                 span: *span,
             })),
+            Value::CStr(text) => Some(Expr::StringLiteral(StringLiteralExpr {
+                value: text.as_str().into(),
+                span: *span,
+            })),
             Value::Bool(b) => Some(Expr::Identifier(IdentifierExpr {
                 name: if *b { "true".into() } else { "false".into() },
                 span: *span,
@@ -232,7 +236,7 @@ impl<'a> TypeChecker<'a> {
                 self.push_scope();
                 self.consteval.comptime_depth += 1;
                 self.value_unused = unused;
-                let mut ret_ty = self.check_expr_block(stmts, consume);
+                let mut ret_ty = self.check_expr_block(stmts, ret.as_deref(), consume);
                 if let Some(r) = ret {
                     ret_ty = self.check_expr_type(r);
                 }
@@ -380,7 +384,7 @@ impl<'a> TypeChecker<'a> {
         let mut then_ty = Type::Struct("void".into(), None);
         if !self.speculating && !if_expr.then_block.is_empty() {
             self.value_unused = unused;
-            then_ty = self.check_expr_block(&mut if_expr.then_block, consume);
+            then_ty = self.check_expr_block(&mut if_expr.then_block, None, consume);
         }
         self.pop_scope();
         let then_facts = self.consteval.constraints.split_off(facts_before);
@@ -399,7 +403,7 @@ impl<'a> TypeChecker<'a> {
                 self.push_releasing_scope();
                 if !self.speculating {
                     self.value_unused = unused;
-                    else_ty = self.check_expr_block(else_b, consume);
+                    else_ty = self.check_expr_block(else_b, None, consume);
                 }
                 self.pop_scope();
                 marks_after_else = self.branch_end(else_b);
@@ -422,8 +426,19 @@ impl<'a> TypeChecker<'a> {
                 }
             }
         } else if !if_expr.is_comptime {
-            // Without else block, it evaluates to unit (represented as dummy Tensor)
-            then_ty = Type::Struct("void".into(), None);
+            // After the error the `if` keeps its `then` branch's type, so that one mistake
+            // gives one error.
+            if !unused {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3048,
+                    "this `if` has no `else`, so it has no value when its condition is false; \
+                     add an `else`, or use the `if` as a statement"
+                        .to_string(),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(&if_expr.span)),
+                );
+            } else {
+                then_ty = Type::Struct("void".into(), None);
+            }
         }
         let else_facts = self.consteval.constraints.split_off(facts_before);
         // When one branch ends early, the code after the `if` is reached only through the other,
@@ -461,16 +476,40 @@ impl<'a> TypeChecker<'a> {
         then_ty
     }
 
+    /// Notes that an operation needing `unsafe` was found (W1010 reads this), and returns true
+    /// when nothing around the operation allows it, so the caller should report an error.
+    pub(crate) fn unsafe_is_missing(&mut self) -> bool {
+        self.unsafe_op_seen = true;
+        !self.in_unsafe_block && !self.speculating
+    }
+
     pub(crate) fn check_unsafeblock_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         let unused = std::mem::replace(&mut self.value_unused, false);
         match expr {
             Expr::UnsafeBlock(UnsafeBlockExpr {
                 stmts,
                 ret: ret_expr,
-                span: _,
+                span,
+                generated,
             }) => {
+                let block_span = *span;
+                let written = !*generated;
                 let prev_unsafe = self.in_unsafe_block;
                 self.in_unsafe_block = true;
+                // A block the compiler made is transparent here: what it holds counts for the
+                // written block around it.
+                let prev_written = self.in_written_unsafe_block;
+                let prev_op_seen = self.unsafe_op_seen;
+                if written {
+                    self.in_written_unsafe_block = true;
+                    self.unsafe_op_seen = false;
+                }
+                let errors_before = self.errors.error_count();
+                // Vx has no plain `{ .. }` block, so one that declares a variable may be there to
+                // end the variable's life early. Removing it would change the program.
+                let declares_a_variable = stmts
+                    .iter()
+                    .any(|s| matches!(s, Statement::LetDecl(l) if !l.name.starts_with("$value")));
                 // `unsafe { let v = ..; v }`, as `vec![..]` writes: the block's drops are placed
                 // when its statements are checked, so the value is moved out of `v` by one of
                 // them, into a `$value` that owns nothing.
@@ -492,12 +531,41 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.push_scope();
                 self.value_unused = unused;
-                let mut ret_ty = self.check_expr_block(stmts, consume);
+                let mut ret_ty = self.check_expr_block(stmts, ret_expr.as_deref(), consume);
                 if let Some(r) = ret_expr {
                     self.value_unused = unused;
                     ret_ty = self.check_expr_type_flag(r, consume);
                 }
                 self.pop_scope();
+                if written {
+                    // An error inside may hide the operation that needed `unsafe`, so only a
+                    // block with no errors in it warns.
+                    if !self.speculating
+                        && !declares_a_variable
+                        && self.errors.error_count() == errors_before
+                    {
+                        let message = if !self.unsafe_op_seen {
+                            Some("this `unsafe` block holds nothing that needs `unsafe`, so it can go")
+                        } else if prev_written {
+                            Some(
+                                "this `unsafe` block is inside another one, which already allows \
+                                 what it holds",
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(message) = message {
+                            self.errors.warn(
+                                crate::diagnostic::DiagnosticCode::W1010,
+                                message,
+                                Some(crate::diagnostic::SourceSpan::from_ast_span(&block_span)),
+                            );
+                        }
+                    }
+                    // What this block holds also needs the block around it, if there is one.
+                    self.unsafe_op_seen |= prev_op_seen;
+                    self.in_written_unsafe_block = prev_written;
+                }
                 self.in_unsafe_block = prev_unsafe;
                 ret_ty
             }
@@ -706,6 +774,18 @@ impl<'a> TypeChecker<'a> {
                         Pattern::EnumVariant(_, variant, _) => covered.push(variant.clone()),
                         _ => {}
                     }
+                    // `_ => {}` and an empty enum variant arm are there to make the match cover
+                    // every case, so they stay quiet. Every arm the compiler writes is one of them.
+                    if arm.body.is_empty()
+                        && !matches!(arm.pattern, Pattern::Wildcard | Pattern::EnumVariant(..))
+                        && !self.speculating
+                    {
+                        self.errors.warn(
+                            crate::diagnostic::DiagnosticCode::W1008,
+                            "this match arm's body is empty, so this case does nothing",
+                            Some(crate::diagnostic::SourceSpan::from_ast_span(&arm.span)),
+                        );
+                    }
                     self.push_scope();
                     self.check_literal_pattern_range(&arm.pattern, &expr_ty);
                     self.bind_pattern_variables(&arm.pattern, &expr_ty);
@@ -719,7 +799,7 @@ impl<'a> TypeChecker<'a> {
 
                     let arm_ty = if !self.speculating {
                         self.value_unused = unused;
-                        self.check_expr_block(&mut arm.body, consume)
+                        self.check_expr_block(&mut arm.body, None, consume)
                     } else {
                         Type::Struct("void".into(), None)
                     };

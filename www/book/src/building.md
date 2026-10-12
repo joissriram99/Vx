@@ -99,7 +99,8 @@ The build succeeds without any of these; each unlocks one path.
 **Autodiff (Enzyme)** — needed for the autodiff tests and for `grad`/`jvp`/`vjp` lowering:
 
 ```bash
-./scripts/provision/install_enzyme.sh
+# The argument is your LLVM 22's bin directory; on macOS, Homebrew's.
+./scripts/provision/build_enzyme.sh /opt/homebrew/opt/llvm@22/bin .cargo/enzyme
 export ENZYME_LIB="$(pwd)/.cargo/enzyme/LLVMEnzyme-22.dylib"   # .so on Linux
 ```
 
@@ -121,7 +122,7 @@ to force it off. The toolkit alone is enough to build; a GPU is only needed to r
 To produce a redistributable tarball from a source build:
 
 ```bash
-./scripts/release/package.sh v0.0.2
+./scripts/release/package.sh v0.0.3
 ```
 
 That stages the compiler, its runtime library, the standard library and the machine files under

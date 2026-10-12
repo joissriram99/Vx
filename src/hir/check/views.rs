@@ -65,7 +65,7 @@ impl View {
 
 impl<'a> TypeChecker<'a> {
     /// The view `expr` makes, when it makes one, and its value is a tensor: a field or index
-    /// chain, `t.reshape(..)`, a view variable, or an `if` or `match` whose value is one of
+    /// chain, `t.reshape(..)` without `PadMode::Pad`, a view variable, or an `if` or `match` whose value is one of
     /// these. A view of a view, or of a tensor reached through a reference, borrows the
     /// tensor itself.
     pub(crate) fn view_of(&self, expr: &Expr, ty: &Type) -> Option<View> {
@@ -78,10 +78,14 @@ impl<'a> TypeChecker<'a> {
                 let (root, path) = Self::extract_base_and_path(expr)?;
                 Some(self.view_into(root, path))
             }
-            Expr::MethodCall(mc) if mc.method_name.as_ref() == "reshape" => match &*mc.base {
-                Expr::Identifier(id) => Some(self.view_into(id.name.to_string(), Vec::new())),
-                base => self.view_of(base, ty),
-            },
+            Expr::MethodCall(mc)
+                if mc.method_name.as_ref() == "reshape" && !mc.is_padding_reshape() =>
+            {
+                match &*mc.base {
+                    Expr::Identifier(id) => Some(self.view_into(id.name.to_string(), Vec::new())),
+                    base => self.view_of(base, ty),
+                }
+            }
             Expr::If(i) => {
                 let mut views = self.tail_views(&i.then_block, ty);
                 views.extend(self.tail_views(i.else_block.as_deref().unwrap_or(&[]), ty));
@@ -205,12 +209,11 @@ impl<'a> TypeChecker<'a> {
                 self.lookup(owner).map(|(t, _)| t),
                 Some(t) if Self::is_ref_type(t)
             );
-            if is_mut
-                && !through_reference
-                && self.lookup(owner).is_some()
-                && !self.is_mutable(owner)
-            {
-                self.report_read_only(owner, "a view of it cannot be declared `mut`", span);
+            if is_mut && !through_reference && self.lookup(owner).is_some() {
+                self.changed_vars.insert(owner.to_string());
+                if !self.is_mutable(owner) {
+                    self.report_read_only(owner, "a view of it cannot be declared `mut`", span);
+                }
             }
         }
         self.borrow_for_view(name, &view, is_mut, span);

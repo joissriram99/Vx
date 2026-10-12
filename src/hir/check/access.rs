@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // One expression family's type checks, split out of the former 5000-line `hir/expr.rs` along the
-// `check_expr_type_flag` dispatch seam (frontend_refactoring_borrow_checker.md R2, #279). An additional
+// `check_expr_type_flag` dispatch seam. An additional
 // `impl TypeChecker` block; moves only, zero logic change. Reaches the shared types and helpers via
 // `use super::super::*`, exactly as `expr.rs` uses `use super::*`.
 //
@@ -158,6 +158,91 @@ impl<'a> TypeChecker<'a> {
         self.eval_expr(expr, &env)
     }
 
+    /// The value of the module `const` `name` where a type uses it: an integer `const` that no
+    /// local of the same name hides.
+    pub(crate) fn const_int(&self, name: &crate::symbol::Symbol) -> Option<i64> {
+        if self.lookup(name.as_ref()).is_some() {
+            return None;
+        }
+        let decl = self.env.consts.get(name).copied()?;
+        if !matches!(&decl.ty, Type::Scalar(e) if e.int_bits().is_some() && *e != ElementType::Bool)
+            || !matches!(crate::registry::ConstTable::from_decl(decl), Ok(None))
+        {
+            return None;
+        }
+        match self.const_value(&decl.expr, &mut vec![name.clone()])? {
+            Value::Int(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Add to `env` the module `const`s `expr` names that `env` does not already hold.
+    pub(crate) fn add_const_ints(
+        &self,
+        expr: &Expr,
+        env: &mut HashMap<crate::symbol::Symbol, Value>,
+    ) {
+        let mut names = Vec::new();
+        Self::collect_identifiers(expr, &mut names);
+        for name in names {
+            if let std::collections::hash_map::Entry::Vacant(slot) = env.entry(name) {
+                if let Some(v) = self.const_int(slot.key()) {
+                    slot.insert(Value::Int(v));
+                }
+            }
+        }
+    }
+
+    /// Write each extent of `ty` that is a module `const`, or arithmetic on numbers and such
+    /// `const`s, as its value. `fold_const_extents` does this for signatures before checking; a
+    /// type written in a function body is folded here, where the local names are known, and
+    /// so is `[R * C]` once a generic instance has put numbers in place of `R` and `C`.
+    pub(crate) fn fold_extents(&self, ty: &mut Type) {
+        match ty {
+            Type::Tensor(_, dims, _) => {
+                for dim in dims {
+                    if let Dim::Static(e) = dim {
+                        if let Some(v) = self.extent_value(e) {
+                            *e = extent_literal(v, e.span());
+                        }
+                    }
+                }
+            }
+            Type::Pointer(inner, ..)
+            | Type::Ref(inner, _)
+            | Type::Borrow { inner, .. }
+            | Type::Verified(inner)
+            | Type::Pinned(inner, _) => self.fold_extents(inner),
+            Type::GenericInstance(base, args) => {
+                self.fold_extents(base);
+                for arg in args {
+                    self.fold_extents(arg);
+                }
+            }
+            Type::Function(params, ret, _) | Type::Closure(params, ret) => {
+                for p in params {
+                    self.fold_extents(p);
+                }
+                self.fold_extents(ret);
+            }
+            _ => {}
+        }
+    }
+
+    /// The value of an extent that is not yet a number, when it is a whole number of at least
+    /// zero worked out from numbers and module `const`s alone. A local stays a name.
+    pub(crate) fn extent_value(&self, e: &Expr) -> Option<i64> {
+        if matches!(e, Expr::Number(_)) {
+            return None;
+        }
+        let mut env = HashMap::new();
+        self.add_const_ints(e, &mut env);
+        match self.eval_expr(e, &env)? {
+            Value::Int(i) if i >= 0 => Some(i),
+            _ => None,
+        }
+    }
+
     /// Every identifier `expr` mentions, for `const_value`.
     fn collect_identifiers(expr: &Expr, out: &mut Vec<crate::symbol::Symbol>) {
         match expr {
@@ -219,6 +304,8 @@ impl<'a> TypeChecker<'a> {
             Expr::Identifier(id) => {
                 let name = id.name.clone();
                 let span = id.span;
+                // Only the identifier a field access starts from is its base.
+                let field_base = std::mem::take(&mut self.checking_field_base);
 
                 if name.as_ref() == "true" || name.as_ref() == "false" {
                     return Type::Scalar(ElementType::Bool);
@@ -261,6 +348,23 @@ impl<'a> TypeChecker<'a> {
                 }
                 // The moved check comes first now. A moved variable keeps its binding, so
                 // the lookup succeeds and testing that first would let the use through.
+                // A field moved out leaves the rest of the variable usable, but not the whole.
+                let moved_field = (!field_base)
+                    .then(|| self.moved_field(name.as_ref(), &[]))
+                    .flatten();
+                if let Some(field) = moved_field {
+                    if !self.speculating {
+                        self.errors.error_with_code(
+                            crate::diagnostic::DiagnosticCode::E4001,
+                            format!(
+                                "`{name}` is used whole, but `{field}` was moved out of it; use \
+                                 its other fields, or give `{field}` a value again first"
+                            ),
+                            Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
+                        );
+                    }
+                    return Type::Unknown;
+                }
                 if self.is_moved(name.as_ref()) {
                     if !self.speculating {
                         self.errors.error_with_code(
@@ -479,6 +583,7 @@ impl<'a> TypeChecker<'a> {
                                         && self
                                             .space_is_cached(&self.value_memory_space(&ty, &top));
                                     if !allowed {
+                                        self.unreadable_reported.insert(span);
                                         match reach {
                                         Reachability::NeedsSeam { cost } => {
                                             // E6003, naming the value's space, the topology's
@@ -545,7 +650,7 @@ impl<'a> TypeChecker<'a> {
     /// or that anything lives at it. `*p`, `p[i]` and `p.field` are one operation with three
     /// spellings, so they answer to one rule.
     fn require_unsafe_raw_access(&mut self, what: &str, span: &Span) {
-        if self.in_unsafe_block || self.speculating {
+        if !self.unsafe_is_missing() {
             return;
         }
         self.errors.error_with_code(
@@ -553,6 +658,100 @@ impl<'a> TypeChecker<'a> {
             format!("{what} requires an unsafe block"),
             Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
         );
+    }
+
+    /// `p.a` read by value: when its value has something to drop, it is moved out of `p`, as in
+    /// Rust, so it is not dropped twice. `p.b` stays usable; `p.a`, and `p` as a whole, do
+    /// not. Moving a field out through a reference, or out of a value whose type has its own
+    /// `Drop`, is refused. A value with nothing to drop is copied, as before.
+    /// [`Self::move_field_out`] for a field whose owner has no name: one reached through `*r`
+    /// is a move out of a reference (E4008), and any other is a temporary's (E4013).
+    fn refuse_move_from_unnamed(
+        &mut self,
+        access: &crate::syntax::MemberAccessExpr,
+        span: Option<crate::diagnostic::SourceSpan>,
+    ) {
+        let mut base = &*access.base;
+        while let Expr::MemberAccess(inner) = base {
+            base = &inner.base;
+        }
+        if matches!(base, Expr::Dereference(_)) {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E4008,
+                "this field cannot be moved out through a reference, which does not own it; \
+                 borrow it or clone it"
+                    .to_string(),
+                span,
+            );
+        } else {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E4013,
+                "this field cannot be moved out of a value with no name, which drops all of its \
+                 fields at the end of the statement; bind the value to a variable first, or \
+                 clone the field"
+                    .to_string(),
+                span,
+            );
+        }
+    }
+
+    pub(crate) fn move_field_out(&mut self, expr: &Expr, ty: &Type) {
+        if self.speculating || matches!(ty, Type::Tensor(..)) {
+            return;
+        }
+        let Expr::MemberAccess(access) = expr else {
+            return;
+        };
+        let span = Some(crate::diagnostic::SourceSpan::from_ast_span(&access.span));
+        let Some((root, path)) = Self::extract_base_and_path(expr) else {
+            // A field of a value with no name, such as a call's result. Nothing can record
+            // the move, and the value drops every field at the end of the statement.
+            if !self.drops_glue(ty).is_empty() {
+                self.refuse_move_from_unnamed(access, span);
+            }
+            return;
+        };
+        if path.iter().any(|p| p.starts_with('[')) || self.drops_glue(ty).is_empty() {
+            return;
+        }
+        let place = Self::field_place(&root, &path);
+        if matches!(
+            self.lookup(&root).map(|(t, _)| t),
+            Some(Type::Borrow { .. } | Type::Pointer(..) | Type::Ref(..))
+        ) {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E4008,
+                format!(
+                    "`{place}` cannot be moved out: `{root}` is a reference and does not own it; \
+                     borrow it (`&{place}`) or clone it"
+                ),
+                span,
+            );
+            return;
+        }
+        let mut base = &*access.base;
+        loop {
+            let base_ty = match self.check_expr_type_probe(base) {
+                Type::Borrow { inner, .. } => *inner,
+                other => other,
+            };
+            if self.drops_impl_call(&base_ty).is_some() {
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E4013,
+                    format!(
+                        "`{place}` cannot be moved out: `{base_ty}` implements `Drop`, whose \
+                         `drop` needs every field; borrow it (`&{place}`) or clone it"
+                    ),
+                    span,
+                );
+                return;
+            }
+            match base {
+                Expr::MemberAccess(inner) => base = &inner.base,
+                _ => break,
+            }
+        }
+        self.consume_field(&root, &path);
     }
 
     pub(crate) fn check_memberaccess_expr(&mut self, expr: &mut Expr) -> Type {
@@ -566,8 +765,29 @@ impl<'a> TypeChecker<'a> {
                 let ma_span = *ma_span;
                 let old_skip = self.borrow.skip_borrow_check;
                 self.borrow.skip_borrow_check = true;
+                let old_field_base = self.checking_field_base;
+                self.checking_field_base = Self::extract_base_and_path(obj).is_some();
                 let obj_ty = self.check_expr_type_flag(obj, false);
+                self.checking_field_base = old_field_base;
                 self.borrow.skip_borrow_check = old_skip;
+                // Reading a field that was moved out, or one inside it. Writing it gives it a
+                // value again, which the assignment handles.
+                if !self.checking_assign_lhs && !self.speculating {
+                    if let Some((root, mut path)) = Self::extract_base_and_path(obj) {
+                        // `p.b.id` after `p.b` moved: reported once, at `p.b`.
+                        let base_moved =
+                            !path.is_empty() && self.moved_field(&root, &path).is_some();
+                        path.push(member.to_string());
+                        if let Some(field) = self.moved_field(&root, &path).filter(|_| !base_moved)
+                        {
+                            self.errors.error_with_code(
+                                crate::diagnostic::DiagnosticCode::E4001,
+                                format!("`{field}` was moved out of `{root}` and has no value"),
+                                Some(crate::diagnostic::SourceSpan::from_ast_span(&ma_span)),
+                            );
+                        }
+                    }
+                }
 
                 if !self.borrow.skip_borrow_check && !self.speculating {
                     if let Some((name, mut path)) = Self::extract_base_and_path(obj) {
@@ -792,6 +1012,120 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
+    /// `(*t)[i]` and `(*t).reshape(..)`, with `t` a tensor reference, are `t[i]` and
+    /// `t.reshape(..)`: both code generators hold a `&Tensor` as the tensor's own buffer, so the
+    /// `*` names the same memory. Rewritten before the base is checked.
+    pub(crate) fn strip_tensor_deref(&self, base: &mut Expr) {
+        if let Expr::Dereference(d) = base {
+            if matches!(
+                self.check_expr_type_probe(&d.expr),
+                Type::Borrow { ref inner, .. } if matches!(**inner, Type::Tensor(..))
+            ) {
+                *base = (*d.expr).clone();
+            }
+        }
+    }
+
+    /// The same at the root of a place: `(*t)[i][j] = x` writes `t[i][j]`, and the place is
+    /// rooted at `t` for the borrow checks.
+    pub(crate) fn strip_tensor_deref_at_root(&self, place: &mut Expr) {
+        match place {
+            Expr::IndexAccess(ix) => self.strip_tensor_deref_at_root(&mut ix.base),
+            Expr::MemberAccess(m) => self.strip_tensor_deref_at_root(&mut m.base),
+            other => self.strip_tensor_deref(other),
+        }
+    }
+
+    /// `t[i]` where the compiler knows both the extent of `t`'s first axis and the largest
+    /// value `i` can take: an index past the end is an error. This holds for a row too, so
+    /// `t[0][j]` cannot reach into the next row.
+    fn check_tensor_index_in_range(
+        &mut self,
+        dims: &[crate::syntax::types::Dim],
+        idx: &Expr,
+        ix_span: &crate::syntax::Span,
+    ) {
+        if self.speculating || !self.mono.closure_captures_stack.is_empty() {
+            return;
+        }
+        let env = self.consteval_snapshot();
+        let Some(Value::Int(extent)) = dims
+            .first()
+            .and_then(|d| d.as_static())
+            .and_then(|e| self.eval_expr(e, &env))
+        else {
+            return;
+        };
+        let Some(largest) = self.largest_index_value(idx, &env) else {
+            return;
+        };
+        if largest >= extent || largest < 0 {
+            let constant = matches!(self.eval_expr(idx, &env), Some(Value::Int(_)));
+            let message = match idx {
+                Expr::Identifier(id) if !constant => format!(
+                    "index `{}` can be {largest}, which is out of range: this dimension has \
+                     {extent} elements",
+                    id.name
+                ),
+                _ => {
+                    format!("index {largest} is out of range: this dimension has {extent} elements")
+                }
+            };
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E8003,
+                message,
+                Some(crate::diagnostic::SourceSpan::from_ast_span(ix_span)),
+            );
+        }
+    }
+
+    /// The largest value an index can take, when the compiler knows it: a constant, or a
+    /// variable with a known upper limit, such as the variable of `for j in 0..6`. `None` for
+    /// a variable that can take no value at all, such as that of `for j in 0..0`, since the
+    /// code that indexes with it never runs.
+    fn largest_index_value(
+        &self,
+        idx: &Expr,
+        env: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> Option<i64> {
+        if let Some(Value::Int(i)) = self.eval_expr(idx, env) {
+            return Some(i);
+        }
+        let Expr::Identifier(id) = idx else {
+            return None;
+        };
+        let (mut lo, mut hi) = (None::<i64>, None::<i64>);
+        for c in &self.consteval.constraints {
+            let Expr::RelationalOp(r) = c else { continue };
+            let Expr::Identifier(l) = &*r.lhs else {
+                continue;
+            };
+            if l.name != id.name {
+                continue;
+            }
+            let Some(Value::Int(v)) = self.eval_expr(&r.rhs, env) else {
+                continue;
+            };
+            let (low, high) = match r.op {
+                RelationalOp::Lt => (None, Some(v - 1)),
+                RelationalOp::Le => (None, Some(v)),
+                RelationalOp::Eq => (Some(v), Some(v)),
+                RelationalOp::Ge => (Some(v), None),
+                RelationalOp::Gt => (Some(v + 1), None),
+                _ => (None, None),
+            };
+            lo = lo.max(low);
+            hi = match (hi, high) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        match (lo, hi) {
+            (Some(lo), Some(hi)) if lo > hi => None,
+            (_, hi) => hi,
+        }
+    }
+
     pub(crate) fn check_indexaccess_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         // `a[i]` on a struct or an enum whose type implements `Index` reads `*a.index(i)`, and
         // a write, `a[i] = x`, goes through `*a.index_mut(i)`, as in Rust.
@@ -799,6 +1133,7 @@ impl<'a> TypeChecker<'a> {
             base, index, span, ..
         }) = expr
         {
+            self.strip_tensor_deref(base);
             let method = if self.checking_assign_lhs {
                 "index_mut"
             } else {
@@ -919,6 +1254,8 @@ impl<'a> TypeChecker<'a> {
                                     &what, &obj_ty, &value_top, cost, &ix_span,
                                 );
                             }
+                            _ if index_root_span(obj)
+                                .is_some_and(|at| self.unreadable_reported.contains(&at)) => {}
                             _ => self.errors.push(format!(
                                 "Cross-topology access error: a value on {} cannot be read from {}",
                                 value_top.display_name(),
@@ -966,6 +1303,9 @@ impl<'a> TypeChecker<'a> {
                     Type::Borrow { inner, .. } => *inner,
                     other => other,
                 };
+                if let Type::Tensor(_, dims, _) = &base {
+                    self.check_tensor_index_in_range(dims, idx, &ix_span);
+                }
                 if let Type::Pointer(..) = &base {
                     self.require_unsafe_raw_access("Indexing a raw pointer", &ix_span);
                     self.check_pointer_target_is_visible(&base, "Indexing a raw pointer", &ix_span);
@@ -1066,10 +1406,27 @@ impl<'a> TypeChecker<'a> {
                 // placement in its type, so each read through it is checked where it happens.
                 let borrows_placed = Self::extract_base_and_path(inner).is_some()
                     && self.check_expr_type_probe(inner).placement().is_some();
+                if *is_mut {
+                    self.record_change(inner);
+                }
                 let old_allow = self.allow_cross_topology;
                 self.allow_cross_topology |= borrows_placed;
                 let inner_ty = self.check_expr_type_flag(inner, false);
                 self.allow_cross_topology = old_allow;
+                // Quiet when a reference to a reference is what was asked for, as in
+                // `let q : &&i64 = &&a;`.
+                let asked_for = matches!(
+                    &self.expected_type,
+                    Some(Type::Borrow { inner, .. }) if matches!(**inner, Type::Borrow { .. })
+                );
+                if matches!(**inner, Expr::Borrow(_)) && !asked_for && !self.speculating {
+                    self.errors.warn(
+                        crate::diagnostic::DiagnosticCode::W1006,
+                        "this borrows a borrow: `&&x` is a reference to a reference, where `&x` \
+                         was probably meant",
+                        Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+                    );
+                }
                 if *is_mut {
                     if let Some(root) = self.read_only_root(inner) {
                         self.report_read_only(&root, "it cannot be borrowed `&mut`", span);
@@ -1096,6 +1453,9 @@ impl<'a> TypeChecker<'a> {
                 let is_reborrow = direct.is_none();
                 let place = direct.or_else(|| self.reborrow_base_and_path(inner));
                 if let Some((name, path)) = place {
+                    if *is_mut {
+                        self.check_two_mut_element_borrows(&name, &path, span);
+                    }
                     self.check_borrow_conflicts(&name, &path, *is_mut, span);
                     if !self.speculating {
                         // `&*rq` points at what `rq` points at, and keeps it borrowed after
@@ -1140,6 +1500,41 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             _ => panic!("Expected IndexAccess, got {:?}", expr),
+        }
+    }
+
+    /// Two `&mut` borrows of different elements of one variable, `&mut a[0]` and `&mut a[1]`,
+    /// are refused even though they do not overlap: the code generators cannot hold both yet.
+    /// Borrows of different fields, `&mut p.x` and `&mut p.y`, are fine.
+    fn check_two_mut_element_borrows(
+        &mut self,
+        name: &str,
+        path: &[String],
+        span: &crate::syntax::Span,
+    ) {
+        if self.speculating {
+            return;
+        }
+        let other_element = self.borrow.live_borrows(name).iter().any(|b| {
+            // Overlapping borrows are refused by `check_borrow_conflicts` already.
+            b.is_mut
+                && !crate::hir::places::paths_may_alias(path, &b.path)
+                && path
+                    .iter()
+                    .zip(&b.path)
+                    .find(|(x, y)| x != y)
+                    .is_some_and(|(x, y)| x.starts_with('[') && y.starts_with('['))
+        });
+        if other_element {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E4004,
+                format!(
+                    "Cannot borrow an element of '{name}' as mutable while another element of \
+                     it is borrowed as mutable. Two `&mut` borrows into one value are not \
+                     supported yet; finish with the first before taking the second."
+                ),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+            );
         }
     }
 
@@ -1232,12 +1627,13 @@ impl<'a> TypeChecker<'a> {
         })
     }
 
-    /// Base variable and field path a reference *argument* reborrows, seeing through a leading `&`.
-    /// `foo(m)` and `foo(&m.slot)` both reborrow storage rooted at `m`; the summary-driven persist
-    /// decision (#243) keys on that base. Returns `None` for arguments with no nameable base
-    /// (`foo(&5)`, `foo(g())`).
+    /// Base variable and field path a reference *argument* reborrows, seeing through a leading `&`
+    /// and an `as` cast. `foo(m)`, `foo(&m.slot)` and `foo((&mut m) as *mut T)` all reborrow
+    /// storage rooted at `m`; the summary-driven persist decision (#243) keys on that base.
+    /// Returns `None` for arguments with no nameable base (`foo(&5)`, `foo(g())`).
     pub(crate) fn arg_reborrow_base(arg: &Expr) -> Option<(String, Vec<String>)> {
         match arg {
+            Expr::AsCast(cast) => Self::arg_reborrow_base(&cast.expr),
             Expr::Borrow(b) => Self::extract_base_and_path(&b.expr),
             other => Self::extract_base_and_path(other),
         }
@@ -1598,18 +1994,33 @@ impl<'a> TypeChecker<'a> {
     /// behind. Persist only when the reborrow outlives the call (the callee returns a reference);
     /// a value/void call borrows only for its own duration.
     #[allow(clippy::too_many_arguments)]
-    /// The read-only variable that changing `place` would change: `x` for `x`, `x.f` or `x[i]`.
-    /// A place reached through a reference variable, `r.f` or `r[i]`, changes what `r` points
-    /// at rather than `r`; `None` then, and for a variable declared `mut`.
-    pub(crate) fn read_only_root(&self, place: &Expr) -> Option<String> {
+    /// The variable that changing `place` would change: `x` for `x`, `x.f` or `x[i]`. A place
+    /// reached through a reference variable, `r.f` or `r[i]`, changes what `r` points at rather
+    /// than `r`; `None` then.
+    pub(crate) fn changed_root(&self, place: &Expr) -> Option<String> {
         let (root, _) = Self::extract_base_and_path(place)?;
         let through_reference = !matches!(place, Expr::Identifier(_))
             && matches!(
                 self.lookup(&root).map(|(t, _)| t),
                 Some(Type::Borrow { .. } | Type::Pointer(..) | Type::Ref(..))
             );
+        (!through_reference).then_some(root)
+    }
+
+    /// Record that `place` changes, so its variable's `mut` is needed. Call it before `place`
+    /// is checked: checking can rewrite `v[i]` into a call, which has no variable to record.
+    pub(crate) fn record_change(&mut self, place: &Expr) {
+        if let Some(root) = self.changed_root(place) {
+            self.changed_vars.insert(root);
+        }
+    }
+
+    /// The read-only variable that changing `place` would change, as [`Self::changed_root`]
+    /// finds it; `None` for a variable declared `mut`.
+    pub(crate) fn read_only_root(&self, place: &Expr) -> Option<String> {
+        let root = self.changed_root(place)?;
         let is_const = self.lookup(&root).is_none() && self.env.consts.contains_key(root.as_str());
-        (is_const || (!through_reference && !self.is_mutable(&root))).then_some(root)
+        (is_const || !self.is_mutable(&root)).then_some(root)
     }
 
     /// E4010: `name` was declared without `mut` and `what` would change it.
@@ -1761,6 +2172,13 @@ impl<'a> TypeChecker<'a> {
         match expr {
             Expr::Dereference(e) => {
                 let inner_ty = self.check_expr_type_flag(&mut e.expr, false);
+                if matches!(*e.expr, Expr::Borrow(_)) && !self.speculating {
+                    self.errors.warn(
+                        crate::diagnostic::DiagnosticCode::W1020,
+                        "this dereferences a borrow made in the same place: `*&x` is just `x`",
+                        Some(crate::diagnostic::SourceSpan::from_ast_span(&e.span)),
+                    );
+                }
                 // Taking the value out of `*r` moves it, and a reference cannot give away
                 // what it points at.
                 if let Type::Borrow { inner, .. } = &inner_ty {
@@ -1806,6 +2224,16 @@ impl<'a> TypeChecker<'a> {
     }
 }
 
+/// An extent of `value`, typed as the parser types a number written in a tensor's shape.
+pub(crate) fn extent_literal(value: i64, span: Span) -> Expr {
+    let value = value.to_string();
+    Expr::Number(NumberExpr {
+        ty: Some(crate::parser::expr::default_number_elem(&value)),
+        value: value.into(),
+        span,
+    })
+}
+
 /// The member-access "unknown struct" message, upgraded when the name is *ambiguous* rather than
 /// absent: two imported modules both defining it used to resolve by merge order before the bare
 /// name learned to decline, and "unknown" would send the user hunting the wrong bug (#291).
@@ -1818,5 +2246,15 @@ fn unknown_struct_message(
         crate::registry::ambiguous_import_message("Struct", struct_name)
     } else {
         format!("Unknown struct '{}' ({})", struct_name, site)
+    }
+}
+
+/// The span of the variable at the root of `v[i].f[j]`, if the root is a variable.
+fn index_root_span(e: &Expr) -> Option<crate::syntax::Span> {
+    match e {
+        Expr::Identifier(id) => Some(id.span),
+        Expr::IndexAccess(IndexAccessExpr { base, .. })
+        | Expr::MemberAccess(MemberAccessExpr { base, .. }) => index_root_span(base),
+        _ => None,
     }
 }

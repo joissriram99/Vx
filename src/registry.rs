@@ -121,7 +121,7 @@ pub struct ImmutableGlobalRegistry {
     /// order* — so the flat lowerer resolves a variant to its discriminant ordinal (`Color::Green` ->
     /// `1`) without walking the AST. Only enums whose every variant is payload-free are listed; a
     /// data-carrying (tagged-union) enum is omitted, so constructing/matching one declines to the AST
-    /// path (#227). Populated by `build_frozen_registry`; empty when deserialized from a `.vxlib`.
+    /// path (#227). Populated by `build_frozen_registry` and when deserialized from a `.vxlib`.
     pub enum_variants: FxHashMap<crate::symbol::Symbol, Vec<crate::symbol::Symbol>>,
     /// Base struct declarations keyed by name, carrying each field's *declared* (possibly generic)
     /// AST type — the field `Type`s the frozen `layouts` erase (a pointer field becomes `Opaque`).
@@ -491,6 +491,14 @@ impl ImmutableGlobalRegistry {
             merge_state: MergeState::default(),
             const_tables: Vec::new(),
             layout_by_base_name,
+        })
+    }
+
+    /// An enum whose variants carry no data: its layout has no fields, and its value is an
+    /// `i32` tag.
+    pub fn is_payload_free_enum(&self, gid: TypeId) -> bool {
+        self.layouts.get(&gid).is_some_and(|d| {
+            d.align_bytes != 0 && d.fields.is_empty() && !self.structs.contains_key(&gid)
         })
     }
 

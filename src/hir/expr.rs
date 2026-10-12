@@ -96,7 +96,25 @@ impl<'a> TypeChecker<'a> {
         ty
     }
 
-    pub(crate) fn check_expr_block(&mut self, stmts: &mut Vec<Statement>, consume: bool) -> Type {
+    /// As [`Self::check_expr_type`], with `expected` as the type an untyped numeric literal in
+    /// `expr` takes.
+    pub(crate) fn check_expr_type_expecting(&mut self, expr: &mut Expr, expected: Type) -> Type {
+        let saved = self.speculating;
+        self.speculating = false;
+        let ty = self.check_expr_expecting(expr, Some(expected), true);
+        self.speculating = saved;
+        ty
+    }
+
+    /// Checks the statements of an `if` or `match` arm, or of an `unsafe`, `comptime` or `spawn`
+    /// block. `tail` is the value such a block ends with after its statements, which the caller
+    /// checks; it is passed here so a borrow it uses lasts until it.
+    pub(crate) fn check_expr_block(
+        &mut self,
+        stmts: &mut Vec<Statement>,
+        tail: Option<&Expr>,
+        consume: bool,
+    ) -> Type {
         Self::name_loop_literals(stmts);
         self.hoist_spawn_allocations(stmts);
         let block_unused = std::mem::replace(&mut self.value_unused, false);
@@ -104,10 +122,14 @@ impl<'a> TypeChecker<'a> {
         let mut terminated = false;
         let mut terminated_at = None;
         let last = stmts.len().saturating_sub(1);
-        // An `if` or `match` arm is a block of its own: what it declares is dropped inside it.
+        // An `if` or `match` arm is a block of its own: what it declares is dropped inside it,
+        // and a borrow made in it ends at its last use there.
         self.drops_enter_block(stmts);
+        self.borrow.enter_block(Self::block_uses(stmts, tail));
 
+        let mut declared = std::collections::HashMap::new();
         for (i, s) in stmts.iter_mut().enumerate() {
+            self.borrow.set_stmt(i);
             self.drops_set_stmt(i);
             if terminated && !self.speculating {
                 let stmt_span = s.span();
@@ -118,6 +140,7 @@ impl<'a> TypeChecker<'a> {
                 );
                 break;
             }
+            self.warn_if_declared_twice(s, &mut declared);
 
             // Only a last expression with no `;` gives the block its value.
             ret_ty = Type::Struct("void".into(), None);
@@ -164,6 +187,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
         self.drops_exit_block(stmts, terminated_at);
+        self.borrow.exit_block();
         ret_ty
     }
 
@@ -224,7 +248,10 @@ impl<'a> TypeChecker<'a> {
                 self.value_unused = value_unused;
                 self.check_comptimeblock_expr(expr, consume)
             }
-            Expr::SpawnOn(..) => self.check_spawnon_expr(expr, consume),
+            Expr::SpawnOn(..) => {
+                self.value_unused = value_unused;
+                self.check_spawnon_expr(expr, consume)
+            }
             Expr::If(..) => {
                 self.value_unused = value_unused;
                 self.check_if_expr(expr, consume)
@@ -240,7 +267,13 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::IndirectCall(..) => self.check_indirectcall_expr(expr, consume),
             Expr::Array(..) => self.check_array_expr(expr),
-            Expr::MemberAccess(..) => self.check_memberaccess_expr(expr),
+            Expr::MemberAccess(..) => {
+                let ty = self.check_memberaccess_expr(expr);
+                if consume {
+                    self.move_field_out(expr, &ty);
+                }
+                ty
+            }
             Expr::IndexAccess(..) => self.check_indexaccess_expr(expr, consume),
             Expr::MethodCall(..) => self.check_methodcall_expr(expr, consume),
             Expr::BinaryOp(..) => self.check_binaryop_expr(expr, consume),
@@ -306,8 +339,9 @@ impl<'a> TypeChecker<'a> {
                 for (_, arg_expr, _) in &mut e.inputs {
                     self.check_expr_type_flag(arg_expr, consume);
                 }
-                // Typecheck clobbers and mark them as mutated if needed
+                // Typecheck clobbers. The block writes to each of them, so each one changes.
                 for clobber in &mut e.clobbers {
+                    self.record_change(clobber);
                     self.check_expr_type_flag(clobber, consume);
                 }
 

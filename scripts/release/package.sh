@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Build a redistributable Vx toolchain tarball for the host platform.
 #
-#   ./scripts/release/package.sh v0.0.2
+#   ./scripts/release/package.sh v0.0.3
 #
 # Produces  dist/vx-<version>-<target>.tar.gz  and its .sha256.
 #
-# The tarball is "slim": it carries the Vx compiler, its runtime library, the standard library
-# and the machine files, but NOT LLVM. The user supplies LLVM 22 through their own package
-# manager, and the installer records where it found it. That keeps the download near 300 MB
-# instead of over a gigabyte, at the cost of one prerequisite.
+# The tarball carries the Vx compiler, its runtime library, the standard library and the machine
+# files. With VX_BUNDLE_LLVM it also carries the LLVM tools vxc runs, built by
+# scripts/provision/build_llvm.sh. Without it, the user supplies LLVM 22 through their own package
+# manager, and the installer records where it found it.
 #
 # Layout produced:
 #
@@ -19,6 +19,7 @@
 #     stdlib/         the standard library, as Vx source
 #     fleet/          machine files for real parts
 #     examples/       runnable programs
+#     llvm/           the LLVM tools and libraries, only with VX_BUNDLE_LLVM
 #     etc/            written at install time, not here
 #
 # Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -29,7 +30,7 @@ set -euo pipefail
 
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-    echo "usage: $0 <version>        e.g. $0 v0.0.2" >&2
+    echo "usage: $0 <version>        e.g. $0 v0.0.3" >&2
     exit 1
 fi
 
@@ -119,10 +120,11 @@ ls "$STAGE/lib/"
 # Tested by glob rather than by counting: `wc -l` pads its output, so a `case` against "0" never
 # matches and the guard silently passes. An unmatched glob leaves the pattern itself in $1, which
 # -e then rejects.
-set -- "$STAGE"/lib/*dispatch.*
+# The shared library is the one `vxc --run` links; a static archive alone used to pass this check.
+set -- "$STAGE"/lib/*dispatch."${DLL}"
 if [ ! -e "$1" ]; then
-    echo "error: no dispatch backend staged into lib/." >&2
-    echo "  Looked in $TARGET_DIR/build/*/out for *dispatch.$DLL and *dispatch.a." >&2
+    echo "error: no shared dispatch library staged into lib/." >&2
+    echo "  Looked in $TARGET_DIR/build/*/out for *dispatch.$DLL." >&2
     echo "  Without it every program using 'spawn on' fails to link." >&2
     exit 1
 fi
@@ -158,11 +160,54 @@ done
 cp -R fleet "$STAGE/fleet"
 
 mkdir -p "$STAGE/examples"
-cp examples/*.vx "$STAGE/examples/" 2>/dev/null || true
+# llama.vx imports a module from tests/ and reads model files from it, so it runs only in a checkout.
+for example in examples/*.vx; do
+    [ "$(basename "$example")" = "llama.vx" ] && continue
+    cp "$example" "$STAGE/examples/"
+done
 
 cp LICENSE "$STAGE/LICENSE"
 cp README.md "$STAGE/README.md"
 echo "$VERSION" > "$STAGE/VERSION"
+
+# ------------------------------------------------------------------- LLVM --
+
+# With VX_BUNDLE_LLVM set to the install from scripts/provision/build_llvm.sh, the toolchain
+# carries the part of LLVM that vxc runs, in llvm/, and the user needs no LLVM of their own. The
+# compiler itself already has MLIR and LLVM linked in; these are the tools it shells out to, the
+# libraries a compiled program loads, and Enzyme.
+if [ -n "${VX_BUNDLE_LLVM:-}" ]; then
+    echo "==> Staging LLVM from $VX_BUNDLE_LLVM"
+    mkdir -p "$STAGE/llvm/bin" "$STAGE/llvm/lib"
+    for tool in llvm-config mlir-translate opt llc clang-22 clang; do
+        [ -e "$VX_BUNDLE_LLVM/bin/$tool" ] || {
+            echo "error: $VX_BUNDLE_LLVM/bin/$tool is missing." >&2
+            exit 1
+        }
+        # -P keeps clang a link to clang-22 rather than a second copy.
+        cp -P "$VX_BUNDLE_LLVM/bin/$tool" "$STAGE/llvm/bin/"
+    done
+    for lib in mlir_c_runner_utils mlir_runner_utils mlir_float16_utils; do
+        set -- "$VX_BUNDLE_LLVM/lib/lib$lib.$DLL"*
+        [ -e "$1" ] || {
+            echo "error: $VX_BUNDLE_LLVM/lib/lib$lib.$DLL is missing." >&2
+            exit 1
+        }
+        cp -P "$@" "$STAGE/llvm/lib/"
+    done
+    # clang's own headers and its runtime library directory.
+    cp -R "$VX_BUNDLE_LLVM/lib/clang" "$STAGE/llvm/lib/"
+    cp -R "$VX_BUNDLE_LLVM/lib/enzyme" "$STAGE/llvm/lib/"
+    du -sh "$STAGE/llvm"
+fi
+
+# With VX_BUNDLE_ENZYME set to an Enzyme plugin, a toolchain that carries no LLVM ships it in
+# lib/enzyme/, to load into the user's LLVM. scripts/provision/build_enzyme.sh builds one.
+if [ -n "${VX_BUNDLE_ENZYME:-}" ]; then
+    echo "==> Staging Enzyme from $VX_BUNDLE_ENZYME"
+    mkdir -p "$STAGE/lib/enzyme"
+    cp "$VX_BUNDLE_ENZYME" "$STAGE/lib/enzyme/"
+fi
 
 # ---------------------------------------------------- relocate the libraries --
 
@@ -187,6 +232,18 @@ if [ "$os" = "Darwin" ]; then
             install_name_tool -change "$dep" "@executable_path/../lib/$base" "$bin"
         done
         install_name_tool -add_rpath "@executable_path/../lib" "$bin" 2>/dev/null || true
+    done
+    # Enzyme loads into the user's opt and must use that opt's libLLVM. The path to the build
+    # machine's libLLVM, and its absolute rpaths, could name a different LLVM on the user's Mac.
+    for plugin in "$STAGE"/lib/enzyme/*.dylib; do
+        [ -f "$plugin" ] || continue
+        llvm=$(otool -L "$plugin" | tail -n +2 | awk '{print $1}' | grep '/libLLVM[^/]*\.dylib$' || true)
+        [ -z "$llvm" ] || install_name_tool -change "$llvm" "@rpath/libLLVM.dylib" "$plugin"
+        rpaths=$(otool -l "$plugin" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' | grep '^/' || true)
+        for rpath in $rpaths; do
+            install_name_tool -delete_rpath "$rpath" "$plugin"
+        done
+        codesign --force --sign - "$plugin"
     done
     # Re-sign: mutating a Mach-O invalidates the ad-hoc signature it was built with, and macOS
     # refuses to run a binary whose signature no longer matches its contents.
@@ -234,9 +291,28 @@ while [ -L "\$self" ]; do
 done
 PREFIX=\$(CDPATH= cd -- "\$(dirname -- "\$self")/.." && pwd)
 
-# Where the installer found LLVM on this machine.
-if [ -f "\$PREFIX/etc/llvm-env.sh" ]; then
+# The LLVM this toolchain carries, if it has one; otherwise the one the installer found on this
+# machine.
+if [ -x "\$PREFIX/llvm/bin/llvm-config" ]; then
+    VX_LLVM_BIN="\$PREFIX/llvm/bin"
+elif [ -f "\$PREFIX/etc/llvm-env.sh" ]; then
     . "\$PREFIX/etc/llvm-env.sh"
+fi
+
+# Enzyme, for grad, vjp and jvp: inside the LLVM this toolchain carries, or on its own in lib/.
+for candidate in "\$PREFIX"/llvm/lib/enzyme/LLVMEnzyme-* "\$PREFIX"/lib/enzyme/LLVMEnzyme-*; do
+    if [ -f "\$candidate" ]; then
+        export ENZYME_LIB="\${ENZYME_LIB:-\$candidate}"
+        break
+    fi
+done
+
+# Upgrading LLVM can delete the folder the installer saved.
+if [ -n "\${VX_LLVM_BIN:-}" ] && [ ! -d "\$VX_LLVM_BIN" ]; then
+    echo "error: Vx was set up to use LLVM in \$VX_LLVM_BIN, which no longer exists." >&2
+    echo "  Run the installer again to find LLVM:" >&2
+    echo "    curl -fsSL https://vxlang.org/install.sh | VX_VERSION=${VERSION} sh" >&2
+    exit 1
 fi
 
 if [ -n "\${VX_LLVM_BIN:-}" ] && [ -d "\$VX_LLVM_BIN" ]; then
@@ -297,6 +373,8 @@ echo "    dist/$ARCHIVE.sha256"
 echo ""
 echo "Smoke-test it somewhere that is not this checkout:"
 echo "    tar -xzf dist/$ARCHIVE -C /tmp"
-echo "    printf 'VX_LLVM_BIN=\"%s\"\\n' \"\$(dirname \"\$(command -v llvm-config)\")\" \\"
-echo "        > /tmp/vx-${VERSION}-${TARGET}/etc/llvm-env.sh"
+if [ -z "${VX_BUNDLE_LLVM:-}" ]; then
+    echo "    printf 'VX_LLVM_BIN=\"%s\"\\n' \"\$(dirname \"\$(command -v llvm-config)\")\" \\"
+    echo "        > /tmp/vx-${VERSION}-${TARGET}/etc/llvm-env.sh"
+fi
 echo "    cd /tmp && /tmp/vx-${VERSION}-${TARGET}/bin/vxc --run <a .vx file>"

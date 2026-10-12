@@ -451,6 +451,79 @@ impl FnEmit<'_> {
         Ok(())
     }
 
+    // `TensorPad`: a fresh buffer of the result shape filled with zeros, with the source copied
+    // into it, the way the oracle lowers a `PadMode::Pad` reshape and `pad`.
+    pub(crate) fn op_tensor_pad(&mut self, idx: usize, ins: &HirInstruction) -> Lowered<()> {
+        let ViewSource {
+            elem,
+            shape,
+            src,
+            src_mem,
+            src_sizes,
+        } = self.view_operands(ins)?;
+        let n: i64 = src_sizes.iter().product();
+        let el = mlir_scalar(&elem).ok_or(crate::emitter_gap!())?;
+        let memty = tensor_memref_ty(&elem, &shape).ok_or(crate::emitter_gap!())?;
+        let dst = match self.nrvo_slot(idx, &memty) {
+            Some(slot) => slot,
+            None => {
+                let d = format!("%v{idx}");
+                self.body += &format!("  {d} = memref.alloc() : {memty}\n");
+                d
+            }
+        };
+        let zero = if el.starts_with('f') || el.starts_with("bf") {
+            "0.0"
+        } else {
+            "0"
+        };
+        // The copy goes from `from` to `to`. Flat: both seen as `n` elements in a row. Each
+        // axis: the source as it is, into a view of the new buffer with the source's sizes and
+        // the new buffer's strides.
+        let (from, from_ty, to, to_ty) = if ins.imm & crate::bytecode::TENSOR_PAD_EACH_AXIS != 0 {
+            let tgt_sizes: Vec<i64> = shape
+                .iter()
+                .map(|d| d.parse().map_err(|_| crate::emitter_gap!()))
+                .collect::<Lowered<_>>()?;
+            if tgt_sizes.len() != src_sizes.len() {
+                return Err(crate::emitter_gap!());
+            }
+            let strides = contiguous_strides(&tgt_sizes);
+            let dims: Vec<String> = src_sizes.iter().map(|d| d.to_string()).collect();
+            let corner_ty = format!(
+                "memref<{}x{el}, strided<[{}], offset: 0>>",
+                dims.join("x"),
+                i64_list(&strides)
+            );
+            self.body += &format!(
+                "  %tpd{idx} = memref.reinterpret_cast {dst} to offset: [0], sizes: [{}], strides: [{}] : {memty} to {corner_ty}\n",
+                i64_list(&src_sizes),
+                i64_list(&strides)
+            );
+            (src, src_mem, format!("%tpd{idx}"), corner_ty)
+        } else {
+            let flat_ty = format!("memref<{n}x{el}>");
+            self.body += &format!(
+                "  %tps{idx} = memref.reinterpret_cast {src} to offset: [0], sizes: [{n}], strides: [1] : {src_mem} to {flat_ty}\n"
+            );
+            self.body += &format!(
+                "  %tpd{idx} = memref.reinterpret_cast {dst} to offset: [0], sizes: [{n}], strides: [1] : {memty} to {flat_ty}\n"
+            );
+            (
+                format!("%tps{idx}"),
+                flat_ty.clone(),
+                format!("%tpd{idx}"),
+                flat_ty,
+            )
+        };
+        self.body += &format!("  %z{idx} = arith.constant {zero} : {el}\n");
+        self.body += &format!("  linalg.fill ins(%z{idx} : {el}) outs({dst} : {memty})\n");
+        self.body += &format!("  memref.copy {from}, {to} : {from_ty} to {to_ty}\n");
+        self.names[idx] = dst;
+        self.mem_of[idx] = Some(memty);
+        Ok(())
+    }
+
     // `TensorMap`: a fresh buffer of the source's shape, each element the closure adapter
     // applied to the source's, as a `linalg.generic` over the two, the way the oracle lowers
     // `map`. A `?` extent is read off the source.
@@ -822,6 +895,29 @@ impl FnEmit<'_> {
             .get(ins.operand1.0 as usize)
             .ok_or(crate::emitter_gap!())?
             .clone();
+        // A rank-1 elementwise result is a vector value, not a buffer: read an element
+        // straight out of it. There is nothing to store into.
+        if let (Some(Some(vecty)), Some(e), false) = (
+            self.vec_of.get(ins.operand1.0 as usize).cloned(),
+            elem_of_gid(result_gid),
+            ins.imm == 1,
+        ) {
+            let imt = mlir_scalar(&self.elem_at(ins.operand2.0).ok_or(crate::emitter_gap!())?)
+                .ok_or(crate::emitter_gap!())?;
+            let et = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
+            let iname = self
+                .names
+                .get(ins.operand2.0 as usize)
+                .ok_or(crate::emitter_gap!())?
+                .clone();
+            let ic = format!("%ic{idx}");
+            let n = format!("%v{idx}");
+            self.body += &format!("  {ic} = arith.index_cast {iname} : {imt} to index\n");
+            self.body += &format!("  {n} = vector.extract {base}[{ic}] : {et} from {vecty}\n");
+            self.names[idx] = n;
+            self.etypes[idx] = Some(e);
+            return Ok(());
+        }
         let base_memty = self
             .mem_of
             .get(ins.operand1.0 as usize)

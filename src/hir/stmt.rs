@@ -15,11 +15,20 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 use crate::hir;
+use crate::hir::borrow_cx::BlockUses;
 use crate::hir::check_state::ComptimeEvalContext;
 use crate::hir::comptime_interpreter::{
     ComptimeFunctionBodies, ComptimeInterpreter, ComptimeObservation,
 };
 use crate::syntax;
+
+/// What a loop's header names for its body. The header runs before every pass.
+pub(crate) struct LoopHeader<'e> {
+    /// The variable a `for` loop declares.
+    pub(crate) binds: Option<&'e str>,
+    /// The iterator a `for` loop takes each value from.
+    pub(crate) evaluates: Option<&'e Expr>,
+}
 
 /// What running a statement did to the block it sits in.
 ///
@@ -125,20 +134,55 @@ impl<'a> TypeChecker<'a> {
     ///    statement (`extract_uses_stmt`) and insert them into `last_use` with the current statement index `i`.
     /// 4. By the end of the pass, `last_use[var]` holds the exact index of the *last* statement
     ///    that references `var` within this block.
-    /// 5. We hand this map to `self.borrow` (via `enter_block`) and advance its statement cursor with
-    ///    `set_stmt`, so the borrow context carries the per-block liveness.
+    /// 5. We hand this map, with the names the block declares, to `self.borrow` (via `enter_block`)
+    ///    and advance its statement cursor with `set_stmt`, so the borrow context carries the
+    ///    per-block liveness.
     ///
     /// This allows the Non-Lexical Lifetimes (NLL) borrow checker to query its `is_variable_used_after`
     /// in O(1) time instead of performing an O(N^2) AST tree-walk!
     pub(crate) fn check_block(&mut self, body: &mut Vec<Statement>, return_type: &Type) {
+        self.check_block_as(body, return_type, None);
+    }
+
+    /// Checks a loop body, which runs again after its last statement. The loop's header runs
+    /// before every pass: `header.binds` is the variable a `for` loop declares, and
+    /// `header.evaluates` the iterator it takes each value from.
+    pub(crate) fn check_loop_body(
+        &mut self,
+        body: &mut Vec<Statement>,
+        return_type: &Type,
+        header: LoopHeader,
+    ) {
+        self.check_block_as(body, return_type, Some(header));
+    }
+
+    fn check_block_as(
+        &mut self,
+        body: &mut Vec<Statement>,
+        return_type: &Type,
+        header: Option<LoopHeader>,
+    ) {
         Self::name_loop_literals(body);
         let mut terminated = false;
+        // Only a loop body has a header; the other block checked here is a function's body.
+        let is_function_body = header.is_none();
 
         // 1. Liveness Analysis Pass
         self.hoist_spawn_allocations(body);
-        let last_use = Self::compute_block_liveness(body);
+        let mut uses = Self::block_uses(body, None);
+        if let Some(LoopHeader { binds, evaluates }) = header {
+            uses.is_loop = true;
+            uses.declared.extend(binds.map(crate::symbol::Symbol::from));
+            if let Some(evaluates) = evaluates {
+                let mut names = HashSet::new();
+                Self::extract_uses_expr(evaluates, &mut names);
+                for name in names {
+                    uses.last_use.entry(name.into()).or_insert(0);
+                }
+            }
+        }
 
-        self.borrow.enter_block(last_use);
+        self.borrow.enter_block(uses);
         self.drops_enter_block(body);
 
         // A block is always checked for real, never speculatively. Force `speculating` off for the
@@ -149,6 +193,12 @@ impl<'a> TypeChecker<'a> {
         self.speculating = false;
 
         let mut terminated_at = None;
+        let mut declared = HashMap::new();
+        if is_function_body {
+            for name in self.borrow.current_params.keys() {
+                declared.insert(name.clone(), true);
+            }
+        }
         #[allow(clippy::needless_range_loop)]
         for i in 0..body.len() {
             self.borrow.set_stmt(i);
@@ -163,6 +213,7 @@ impl<'a> TypeChecker<'a> {
                 break; // Only warn once per block
             }
 
+            self.warn_if_declared_twice(&body[i], &mut declared);
             self.check_statement(&mut body[i], return_type, true);
             match &body[i] {
                 Statement::Return(_) | Statement::Break(_) | Statement::Continue(_) => {
@@ -177,12 +228,75 @@ impl<'a> TypeChecker<'a> {
         self.borrow.exit_block();
     }
 
+    /// W1005: `stmt` is a `let` of a name its block already declared, so the earlier value can no
+    /// longer be named. `declared` maps each name declared so far to whether it is a parameter.
+    pub(crate) fn warn_if_declared_twice(
+        &mut self,
+        stmt: &Statement,
+        declared: &mut HashMap<crate::symbol::Symbol, bool>,
+    ) {
+        let Statement::LetDecl(decl) = stmt else {
+            return;
+        };
+        // Names the compiler makes up start with `$` or `_`, and a let with no position is one
+        // it wrote. A `_` name also says the program does not mean to use the value.
+        let name: &str = decl.name.as_ref();
+        if name.starts_with(['$', '_']) || decl.span == Span::default() {
+            return;
+        }
+        let message = match declared.insert(decl.name.clone(), false) {
+            None => return,
+            Some(true) => {
+                format!("`{name}` is already a parameter of this function; this `let` hides it")
+            }
+            Some(false) => {
+                format!(
+                    "`{name}` is already declared in this block; this `let` hides the earlier one"
+                )
+            }
+        };
+        if !self.speculating {
+            self.errors.warn(
+                crate::diagnostic::DiagnosticCode::W1005,
+                message,
+                Some(crate::diagnostic::SourceSpan::from_ast_span(&decl.span)),
+            );
+        }
+    }
+
     /// Drop the bindings of comptime lambdas once their calls have folded.
     ///
     /// Nothing is left to call, and keeping the binding emits the closure and its generated
     /// body -- the run-time code a `comptime` block must not leave behind.
     pub(crate) fn drop_spent_comptime_lambdas(body: &mut Vec<Statement>) {
         body.retain(|stmt| !Self::binds_a_comptime_lambda(stmt));
+    }
+
+    /// What the borrow checker needs to know about `body` before checking it: the last statement
+    /// that names each variable, and the variables `body` declares. `tail` is a value the block
+    /// ends with after its statements, such as an `unsafe` block's result; it counts as one more
+    /// statement.
+    pub(crate) fn block_uses(body: &[Statement], tail: Option<&Expr>) -> BlockUses {
+        let mut last_use = Self::compute_block_liveness(body);
+        if let Some(tail) = tail {
+            let mut names = HashSet::new();
+            Self::extract_uses_expr(tail, &mut names);
+            for name in names {
+                last_use.insert(name.into(), body.len());
+            }
+        }
+        let declared = body
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Statement::LetDecl(l) => Some(l.name.clone()),
+                _ => None,
+            })
+            .collect();
+        BlockUses {
+            last_use,
+            declared,
+            is_loop: false,
+        }
     }
 
     pub(crate) fn compute_block_liveness(
@@ -272,12 +386,18 @@ impl<'a> TypeChecker<'a> {
             expr,
             span,
         } = decl;
-        // Track declared variables for W1001 (unused variable) detection
+        // Track declared variables for W1001 (unused variable) and W1004 (`mut` never needed)
         self.declared_vars.push((name.clone(), *span));
+        if *_is_mut {
+            self.declared_mut_vars.push((name.clone(), *span));
+        }
 
         self.current_assignment_target = Some(name.to_string());
         // Forward the annotation as an expected-type hint so a generic call can
         // deduce a return-only topology/type variable from it.
+        if let Some(ann) = ty_ann.as_mut() {
+            self.fold_extents(ann);
+        }
         let prev_expected = self.expected_type.take();
         self.expected_type = ty_ann.clone();
         let ty = self.check_expr_type_flag(expr, consume);
@@ -752,7 +872,11 @@ impl<'a> TypeChecker<'a> {
         let marks_before = self.moved_snapshot();
         self.borrow.loop_exits.push(Default::default());
         self.drops_enter_loop();
-        self.check_block(body, return_type);
+        let header = LoopHeader {
+            binds: Some(iter.as_str()),
+            evaluates: Some(&**iterable),
+        };
+        self.check_loop_body(body, return_type, header);
         self.drops_exit_loop();
         self.settle_loop_moves(marks_before, outer_depth, body, &loop_span);
 
@@ -851,7 +975,11 @@ impl<'a> TypeChecker<'a> {
         let marks_before = self.moved_snapshot();
         self.borrow.loop_exits.push(Default::default());
         self.drops_enter_loop();
-        self.check_block(body, return_type);
+        let header = LoopHeader {
+            binds: None,
+            evaluates: None,
+        };
+        self.check_loop_body(body, return_type, header);
         self.drops_exit_loop();
         self.settle_loop_moves(marks_before, outer_depth, body, &loop_span);
 
@@ -941,6 +1069,7 @@ impl<'a> TypeChecker<'a> {
         consume: bool,
         operand_ty: Option<&mut Option<crate::syntax::ElementType>>,
     ) {
+        self.strip_tensor_deref_at_root(lhs);
         // Assigning to a moved variable gives it a value again. A write does not read what
         // was there, so the move stops being in the way -- and the mark has to go before the
         // left-hand side is checked, which is what would otherwise report it as a use.
@@ -948,14 +1077,23 @@ impl<'a> TypeChecker<'a> {
         // Only a plain `x = v`. `x op= v` reads `x` first, and `a[i] = v` writes *through* a
         // value the name no longer owns; both stay refused.
         let mut owner_before = None;
+        let mut moved_fields_before = Vec::new();
         if op.is_none() {
             if let Expr::Identifier(id) = lhs {
                 owner_before = self.drops_owner_state(id.name.as_ref());
                 self.unconsume(id.name.as_ref());
             }
+            // `p.a = v` after `p.a` was moved out gives the field a value again.
+            if let Expr::MemberAccess(_) = lhs {
+                if let Some((root, path)) = Self::extract_base_and_path(lhs) {
+                    moved_fields_before = self.drops_moved_fields(&root);
+                    self.unconsume_field(&root, &path);
+                }
+            }
         }
 
         self.check_assign_while_borrowed(lhs);
+        self.record_change(lhs);
         if let Some(root) = self.read_only_root(lhs) {
             self.report_read_only(&root, "it cannot be assigned", &lhs.span());
         }
@@ -1033,6 +1171,8 @@ impl<'a> TypeChecker<'a> {
                             .copy_borrows(from.name.as_ref(), id.name.as_ref(), depth);
                     }
                 }
+            } else {
+                self.drops_note_place_assign(lhs, &lhs_ty, lhs.span().line, &moved_fields_before);
             }
         }
         if let Some(op) = op {
@@ -1561,10 +1701,10 @@ impl<'a> TypeChecker<'a> {
                     Some(t) => t.is_float(),
                     None => n_str.contains('.') || n_str.contains('e') || n_str.contains('E'),
                 };
+                // An integer too big for an i64 has no value. Read as a float it would lose its
+                // low digits: `u64::MAX` was worked out as 18446744073709551616.
                 if !is_float {
-                    if let Ok(i) = n_str.parse::<i64>() {
-                        return Some(Value::Int(i));
-                    }
+                    return n_str.parse::<i64>().ok().map(Value::Int);
                 }
                 n_str.parse::<f64>().ok().map(Value::Number)
             }
@@ -1713,6 +1853,16 @@ impl<'a> TypeChecker<'a> {
                     None
                 }
             }
+            // No value for the one negation that overflows, as for the other operators.
+            Expr::UnaryOp(UnaryOpExpr {
+                op: UnaryOp::Neg,
+                expr: inner,
+                span: _,
+            }) => match self.eval_expr(inner, env)? {
+                Value::Int(i) => i.checked_neg().map(Value::Int),
+                Value::Number(n) => Some(Value::Number(-n)),
+                _ => None,
+            },
             // `[ a, b, c ]`. Every element has to be known, or the whole array is unknown:
             // a half-built array would let a later index read a value that was never there.
             Expr::Array(ArrayExpr { elements, span: _ }) => {
@@ -1946,7 +2096,7 @@ impl<'a> TypeChecker<'a> {
         self.callee_body(name)
     }
 
-    fn callee_body(&self, name: &str) -> Option<&Function> {
+    pub(crate) fn callee_body(&self, name: &str) -> Option<&Function> {
         if let Some(func) = self.env.syntax_functions.get(name) {
             if !func.body.is_empty() {
                 return Some(func);

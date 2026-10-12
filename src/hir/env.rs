@@ -36,6 +36,15 @@ pub enum Value {
     /// A fixed-size array of scalars, known at compile time. The length is set when the
     /// array is built and never changes, so an index past the end is a compile error.
     Array(Vec<Value>),
+    /// A place in a byte buffer that a `comptime` block made from a string literal. It only
+    /// exists while the block runs; every copy of the pointer sees the same bytes.
+    Ptr {
+        block: usize,
+        offset: i64,
+    },
+    /// The text a `comptime` block's pointer result points at, up to its NUL. Written into the
+    /// program as a string literal.
+    CStr(String),
 }
 
 impl Value {
@@ -48,6 +57,16 @@ impl Value {
             _ => None,
         }
     }
+}
+
+/// Two impls of the same trait for the same type — see [`GlobalAstEnv::duplicate_impls`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateImpl {
+    /// How the impl is written: `Describe for Point`.
+    pub what: String,
+    /// The module of the impl indexed first, and of the one that repeats it.
+    pub first: crate::symbol::Symbol,
+    pub second: crate::symbol::Symbol,
 }
 
 /// One `Memory`/`Topology` name declared by two modules with *different* declarations — see
@@ -102,6 +121,9 @@ pub struct GlobalAstEnv<'a> {
     /// iteration, so the machine model actually in force would vary between runs. Recorded here
     /// and reported as E6012 by `check_declaration_conflicts` (#281).
     pub duplicate_decls: Vec<DuplicateDecl>,
+    /// A second impl of a trait for a type that already has one, reported as E3049 by
+    /// `check_declaration_conflicts`. A call to one of its methods could not choose.
+    pub duplicate_impls: Vec<DuplicateImpl>,
     /// Per-function return-provenance summary (#243): which parameter slot(s) a reference-returning
     /// function's result roots in. A read-only, precomputed artifact of the immutable env, consulted
     /// at call sites to make the reborrow-persistence decision per argument. Filled from *present*
@@ -143,6 +165,7 @@ impl<'a> GlobalAstEnv<'a> {
             memories: HashMap::new(),
             topologies: HashMap::new(),
             duplicate_decls: Vec::new(),
+            duplicate_impls: Vec::new(),
             transfer_impls: Vec::new(),
             externs: Vec::new(),
             return_provenances: HashMap::new(),
@@ -150,6 +173,8 @@ impl<'a> GlobalAstEnv<'a> {
             consts: HashMap::new(),
         };
 
+        // Where each trait impl was first written, to report a second one for the same type.
+        let mut impl_modules: HashMap<String, (crate::symbol::Symbol, &ImplBlock)> = HashMap::new();
         for &module in modules {
             let module_hash = crate::hash::compute_module_hash(&module.module_path);
             for s in &module.structs {
@@ -204,6 +229,29 @@ impl<'a> GlobalAstEnv<'a> {
                     Some(name) => name.clone(),
                     None => "_inherent".to_string().into(),
                 };
+                if i.trait_name.is_some() {
+                    let args: Vec<String> = i.trait_args.iter().map(|a| a.to_string()).collect();
+                    let what = if args.is_empty() {
+                        format!("{} for {}", trait_name, i.target_type)
+                    } else {
+                        format!("{}<{}> for {}", trait_name, args.join(", "), i.target_type)
+                    };
+                    match impl_modules.get(&what) {
+                        // The same impl under another module name is one module given twice,
+                        // by its file and by its import path, not a second impl.
+                        Some((first, block)) if *first == module.module_path || *block != i => {
+                            env.duplicate_impls.push(DuplicateImpl {
+                                what: what.clone(),
+                                first: first.clone(),
+                                second: module.module_path.clone(),
+                            })
+                        }
+                        Some(_) => {}
+                        None => {
+                            impl_modules.insert(what, (module.module_path.clone(), i));
+                        }
+                    }
+                }
                 env.impls.entry(trait_name).or_default().push(i);
             }
             for ext in &module.externs {
@@ -324,6 +372,10 @@ impl<'a> GlobalAstEnv<'a> {
                 for stmt in &func.body {
                     collect_comptime_seeds(stmt, &mut pending);
                 }
+                // A comptime function runs only while compiling, wherever it is called from.
+                if TypeChecker::is_comptime_fn(func) {
+                    pending.push(func.name.to_string());
+                }
             }
         }
 
@@ -395,22 +447,30 @@ pub struct TypeChecker<'a> {
     pub allow_cross_topology: bool,
     pub errors: crate::diagnostic::DiagnosticsVec,
     pub(crate) in_unsafe_block: bool,
+    /// Inside an `unsafe` block someone wrote, not only one the compiler made for `vec![..]`.
+    pub(crate) in_written_unsafe_block: bool,
+    /// Something that needs `unsafe` was checked since the innermost written `unsafe` block
+    /// began. If it stays false, that block warns (W1010).
+    pub(crate) unsafe_op_seen: bool,
     pub(crate) active_topology: Topology,
     pub(crate) active_memory: MemorySpace,
     pub transfer_cost_graph: &'a crate::arch::TransferCostGraph,
     /// Borrow-checking state (active records + NLL liveness), encapsulated so a conflict-check read
-    /// cannot bypass the dead-borrow sweep (frontend_refactoring_borrow_checker.md R1; the #276 bug class). Replaces
-    /// the former `active_borrows` / `block_liveness` / `current_stmt_idx` fields.
+    /// cannot bypass the dead-borrow sweep. Replaces the former `active_borrows` /
+    /// `block_liveness` / `current_stmt_idx` fields.
     pub(crate) borrow: crate::hir::borrow_cx::BorrowCx,
     /// Speculative-check mode. When set, expression checking is a *probe* — diagnostics are
     /// suppressed, borrow/move side effects and unreachable-code warnings are skipped, and
     /// `check_if_expr`/`check_match_expr` return a placeholder without descending into the block.
-    /// Replaces the `silent: bool` parameter that used to thread through ~36 checker signatures
-    /// (frontend_refactoring_borrow_checker.md R3, #279). The only site that turns it on is the
+    /// Replaces the `silent: bool` parameter that used to thread through ~36 checker signatures.
+    /// The only site that turns it on is the
     /// method-call → function-call return-type probe in `check_methodcall_expr`; the two
     /// "fresh check" entry points (`check_expr_type`, `check_block`) force it back off, so the
     /// field's dynamic scope reproduces the old parameter's exactly.
     pub(crate) speculating: bool,
+    /// Identifiers already reported as unreadable from the active topology, so the indexing of
+    /// the same read (`c[0][0]`) does not report it again.
+    pub(crate) unreadable_reported: std::collections::HashSet<crate::syntax::Span>,
     /// The name being indexed while the base of `name[i]` is checked: the one place a `const`
     /// table may be named.
     pub(crate) indexed_name: Option<crate::symbol::Symbol>,
@@ -423,6 +483,9 @@ pub struct TypeChecker<'a> {
     /// Set while checking the left-hand side of an assignment (plain or compound): a container
     /// index there is a *store* place, so the `v[i]` -> `v.get(i)` read rewrite must not fire.
     pub(crate) checking_assign_lhs: bool,
+    /// The identifier being checked is the base of a field access, `p` in `p.b`: a move of
+    /// another field, `p.a`, does not stop it.
+    pub(crate) checking_field_base: bool,
     pub(crate) next_id: u32,
     pub current_return_type: Option<Type>,
     /// Name of the function being checked, so a record produced deep inside a body can say
@@ -434,6 +497,11 @@ pub struct TypeChecker<'a> {
     pub(crate) used_vars: std::collections::HashSet<crate::symbol::Symbol>,
     /// Tracks declared variables with their spans (for unused variable warnings).
     pub(crate) declared_vars: Vec<(crate::symbol::Symbol, crate::syntax::Span)>,
+    /// The current function's `let mut` bindings, for the warning about a `mut` never needed.
+    pub(crate) declared_mut_vars: Vec<(crate::symbol::Symbol, crate::syntax::Span)>,
+    /// The variables the current function changes: assigns, borrows `&mut`, or calls a
+    /// `&mut self` method on.
+    pub(crate) changed_vars: std::collections::HashSet<String>,
     /// Expected type of the expression currently being checked, from a `let x: T = …` or a
     /// `return` in a typed function. Lets a generic call deduce a *return-only* topology (or
     /// type) variable — e.g. `D` in `-> Pinned<T, D>` — from the call's context.
@@ -465,21 +533,27 @@ impl<'a> TypeChecker<'a> {
             scopes: vec![HashMap::new()],
             errors: crate::diagnostic::DiagnosticsVec::new(),
             in_unsafe_block: false,
+            in_written_unsafe_block: false,
+            unsafe_op_seen: false,
             allow_cross_topology: false,
             active_topology: Topology::CPU,
             active_memory,
             transfer_cost_graph,
             borrow: crate::hir::borrow_cx::BorrowCx::default(),
             speculating: false,
+            unreadable_reported: Default::default(),
             indexed_name: None,
             value_unused: false,
             checking_assign_lhs: false,
+            checking_field_base: false,
             next_id: 1,
             current_return_type: None,
             current_function: String::new(),
             current_assignment_target: None,
             used_vars: std::collections::HashSet::new(),
             declared_vars: Vec::new(),
+            declared_mut_vars: Vec::new(),
+            changed_vars: std::collections::HashSet::new(),
             expected_type: None,
             consteval: Default::default(),
             mono: Default::default(),
@@ -540,6 +614,11 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub fn insert(&mut self, name: String, ty: Type) {
+        // A new variable of this name: the fields moved out of the old one say nothing about it.
+        if let Some(moved) = self.borrow.moved_vars.last_mut() {
+            let prefix = format!("{name}.");
+            moved.retain(|place| !place.starts_with(&prefix));
+        }
         let current_top = self.active_topology.clone();
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.into(), (ty, current_top));
@@ -810,6 +889,9 @@ impl<'a> TypeChecker<'a> {
         self.drops_note_move(name, true);
         if let Some(moved) = self.borrow.moved_vars.get_mut(scope) {
             moved.remove(name);
+            // A whole new value: none of its fields is moved out any more.
+            let prefix = format!("{name}.");
+            moved.retain(|place| !place.starts_with(&prefix));
         }
     }
 
@@ -869,6 +951,63 @@ impl<'a> TypeChecker<'a> {
         self.scopes
             .iter()
             .rposition(|scope| scope.contains_key(name))
+    }
+
+    /// `root.path` as a moved place is written: `p.a.c`.
+    pub(crate) fn field_place(root: &str, path: &[String]) -> String {
+        std::iter::once(root.to_string())
+            .chain(path.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// The moved field of `root` that `root.path` is, or is inside: `p.a` for `p.a.c` after
+    /// `let x = p.a`. With an empty `path`, any moved field of `root`.
+    pub(crate) fn moved_field(&self, root: &str, path: &[String]) -> Option<String> {
+        let scope = self.scope_of(root)?;
+        let place = Self::field_place(root, path);
+        self.borrow.moved_vars[scope]
+            .iter()
+            .filter(|m| m.contains('.'))
+            .find(|m| {
+                if path.is_empty() {
+                    m.starts_with(&format!("{root}."))
+                } else {
+                    place == **m || place.starts_with(&format!("{m}."))
+                }
+            })
+            .cloned()
+    }
+
+    /// `root.path` was moved out: `let x = p.a`.
+    pub(crate) fn consume_field(&mut self, root: &str, path: &[String]) {
+        let Some(scope) = self.scope_of(root) else {
+            return;
+        };
+        let place = Self::field_place(root, path);
+        self.drops_note_field_move(root, path, false);
+        if let Some(moved) = self.borrow.moved_vars.get_mut(scope) {
+            moved.insert(place);
+        }
+    }
+
+    /// `root.path` was given a value again: `p.a = v` after `let x = p.a`.
+    pub(crate) fn unconsume_field(&mut self, root: &str, path: &[String]) {
+        let Some(scope) = self.scope_of(root) else {
+            return;
+        };
+        let place = Self::field_place(root, path);
+        let inside = format!("{place}.");
+        let was_moved = self.borrow.moved_vars[scope]
+            .iter()
+            .any(|m| *m == place || m.starts_with(&inside));
+        if !was_moved {
+            return;
+        }
+        self.drops_note_field_move(root, path, true);
+        if let Some(moved) = self.borrow.moved_vars.get_mut(scope) {
+            moved.retain(|m| *m != place && !m.starts_with(&inside));
+        }
     }
 
     pub fn is_moved(&self, name: &str) -> bool {
@@ -1320,7 +1459,7 @@ impl<'a> TypeChecker<'a> {
             .collect();
 
         Function {
-            is_unsafe: false,
+            is_unsafe: generic_func.is_unsafe,
             name: mangled_name.into(),
             generics: Vec::new(),
             params: new_params,
@@ -1472,6 +1611,11 @@ impl<'a> TypeChecker<'a> {
         // method call.
         let prev_used_vars = std::mem::take(&mut self.used_vars);
         let prev_declared_vars = std::mem::take(&mut self.declared_vars);
+        let prev_declared_mut_vars = std::mem::take(&mut self.declared_mut_vars);
+        let prev_changed_vars = std::mem::take(&mut self.changed_vars);
+        // The same for W1010: the callee's `unsafe` blocks are not inside the caller's.
+        let prev_written_unsafe = std::mem::take(&mut self.in_written_unsafe_block);
+        let prev_unsafe_op_seen = std::mem::take(&mut self.unsafe_op_seen);
         self.push_scope();
 
         let prev_top = self.active_topology.clone();
@@ -1525,7 +1669,21 @@ impl<'a> TypeChecker<'a> {
             .map(|(n, t)| (n.to_string(), t.clone()))
             .collect();
         self.drops_enter_function(owned_params, &func.body);
+        // A comptime function with parameters folds at each call, where they have values, so
+        // its block is not folded here, the same as a comptime lambda's body. Without
+        // parameters it folds here as well, so an error in it is reported even with no call.
+        let comptime_fn = Self::is_comptime_fn(func) && !func.params.is_empty();
+        let outer_comptime = if comptime_fn {
+            self.consteval.closure_body_depth += 1;
+            std::mem::take(&mut self.consteval.comptime_depth)
+        } else {
+            self.consteval.comptime_depth
+        };
         self.check_block(&mut func.body, &func.return_type.clone());
+        if comptime_fn {
+            self.consteval.closure_body_depth -= 1;
+            self.consteval.comptime_depth = outer_comptime;
+        }
         self.drops_exit_function();
         Self::drop_spent_comptime_lambdas(&mut func.body);
 
@@ -1581,6 +1739,28 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // W1004: a `let mut` binding that never changes. An unused one already has W1001. An
+        // instance of a generic function is skipped: `it.next()` changes `it` for some types
+        // and not for a reference, so the `mut` may be needed by another instance.
+        let is_instance = self.mono.being_checked.contains(&func.name);
+        for (var_name, var_span) in std::mem::take(&mut self.declared_mut_vars) {
+            let name_str: &str = var_name.as_ref();
+            if !self.speculating
+                && !is_instance
+                && !name_str.starts_with(['_', '$'])
+                && self.used_vars.contains(&var_name)
+                && !self.changed_vars.contains(name_str)
+            {
+                self.errors.warn(
+                    crate::diagnostic::DiagnosticCode::W1004,
+                    format!(
+                        "`{var_name}` is declared `mut` but never changes, so the `mut` can go"
+                    ),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(&var_span)),
+                );
+            }
+        }
+
         // The whole function has been checked; verify the working set of each memory space
         // it places tiles into fits (or is `overcommit`). Clears the per-function placement map.
         self.check_cumulative_capacity();
@@ -1603,6 +1783,10 @@ impl<'a> TypeChecker<'a> {
         self.borrow.restore_borrowers(prev_borrowers);
         self.used_vars = prev_used_vars;
         self.declared_vars = prev_declared_vars;
+        self.declared_mut_vars = prev_declared_mut_vars;
+        self.changed_vars = prev_changed_vars;
+        self.in_written_unsafe_block = prev_written_unsafe;
+        self.unsafe_op_seen = prev_unsafe_op_seen;
     }
 
     pub fn parse_ty_str(&self, s: &str) -> Type {

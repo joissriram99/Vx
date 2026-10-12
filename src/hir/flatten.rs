@@ -413,6 +413,9 @@ struct Lowerer<'r> {
     /// the match's fall-through merge block needs a terminator, so it returns a default (zero) value of
     /// this type — mirroring the AST codegen's default-return merge block (`Option::unwrap`). (#242)
     ret_ty: Option<LoweredTy>,
+    /// The function returns `void`. Its `return f(x);` (a closure body calling a void function)
+    /// runs the call and returns nothing.
+    ret_void: bool,
     /// Base locals whose address must be **materialized** — a borrow of them *escapes* (a call arg, a
     /// return, a struct field, or a reference local used as anything but `*r`). Such a local lives in an
     /// addressable `Slot` so `&x` has a real pointer to yield. This refines the old "any `&x` slots x"
@@ -503,6 +506,7 @@ impl<'r> Lowerer<'r> {
             inline_blocks: Vec::new(),
             instance_layouts: HashMap::new(),
             ret_ty: None,
+            ret_void: false,
             materialized: HashSet::new(),
             mutated: HashSet::new(),
             has_control_flow: false,
@@ -654,6 +658,15 @@ impl<'r> Lowerer<'r> {
         }
     }
 
+    /// A `print` operand without the cast the checker puts on a tensor of `u32` or `u64` for
+    /// the AST code generator. Here the print reads the element type from the tensor's own type.
+    fn print_operand(arg: &Expr) -> &Expr {
+        match arg {
+            Expr::AsCast(c) if matches!(c.target_ty, Type::Tensor(..)) => &c.expr,
+            other => other,
+        }
+    }
+
     fn emit_print(&mut self, v: Val) -> Lowered<()> {
         // A rank-0 tensor prints as a bare scalar on the AST path (its `vx.transfer` never
         // materializes the buffer); the flat memref print would render differently, so the
@@ -743,7 +756,7 @@ impl<'r> Lowerer<'r> {
             .ok_or(missing)?;
             return Ok(());
         }
-        let v = self.lower_expr(arg)?;
+        let v = self.lower_expr(Self::print_operand(arg))?;
         self.emit_print(v)?;
         Ok(())
     }
@@ -1166,7 +1179,7 @@ impl<'r> Lowerer<'r> {
                 // emits `llvm.inttoptr` -- the same op the AST path uses. Only integer sources:
                 // inttoptr of a float is not valid IR on either path.
                 if matches!(c.target_ty, Type::Pointer(..)) {
-                    // `&mut x as *mut T`: the borrow already is the address.
+                    // `&mut x as *mut T`, or `*const T` to `*mut T`: the value already is the address.
                     if matches!(v.ty, LoweredTy::Ptr) {
                         return Ok(v);
                     }
@@ -1328,8 +1341,14 @@ impl<'r> Lowerer<'r> {
                         })
                     }
                 };
-                let mem_id = crate::arch::memory_space_dispatch_id(&t.space) as u64;
-                Ok(self.emit_typed(Opcode::Transfer, src.reg, Register(0), result_ty, mem_id))
+                let mem_id = crate::arch::memory_space_dispatch_id(&t.space) as u32 as u64;
+                // Where the value is now, which its type says when it is pinned to a topology.
+                let source = match self.infer_ast_type(&t.expr) {
+                    Some(Type::Pinned(_, top)) => crate::arch::topology_dispatch_id(&top) as u32,
+                    _ => 0,
+                };
+                let imm = mem_id | ((source as u64) << 32);
+                Ok(self.emit_typed(Opcode::Transfer, src.reg, Register(0), result_ty, imm))
             }
             // `Tensor<T>([..])` allocates a buffer. Any other name is an ordinary function call.
             Expr::FunctionCall(fc) => {
@@ -1679,6 +1698,12 @@ impl<'r> Lowerer<'r> {
                 Ok(self.emit_value(Opcode::Const, Register(0), Register(0), ElementType::I32, 0))
             }
             Expr::MethodCall(mc) if matches!(mc.method_name.as_ref(), "reshape" | "transpose") => {
+                self.lower_tensor_reshape(mc)
+            }
+            Expr::MethodCall(mc)
+                if mc.method_name.as_ref() == "pad"
+                    && matches!(mc.args.as_slice(), [Expr::Array(_)]) =>
+            {
                 self.lower_tensor_reshape(mc)
             }
             Expr::MethodCall(mc) if mc.method_name.as_ref() == "clone" && mc.args.is_empty() => {
@@ -2858,8 +2883,15 @@ impl<'r> Lowerer<'r> {
                 what: "a spawn expression whose region has no value",
             });
         }
-        let top_id = crate::arch::topology_dispatch_id(&s.top);
-        self.emit_effect(Opcode::Spawn, Register(0), Register(0), top_id as u64);
+        let top_id = crate::arch::topology_dispatch_id(&s.top) as u32 as u64;
+        let name = self.strings.len() as u64 + 1;
+        self.strings.push(s.top.display_name());
+        self.emit_effect(
+            Opcode::Spawn,
+            Register(0),
+            Register(0),
+            top_id | (name << 32),
+        );
         // Two proofs are offered, FLAT FIRST. The flat grid-stride (#251) is the measured
         // record shape -- one thread per iteration, slice bodies vectorized -- so a region it
         // covers must keep it: since the block-row write rule (Vx#379 R3) landed, a plain
@@ -3122,6 +3154,32 @@ impl<'r> Lowerer<'r> {
             // A by-value field that is itself an instance (`Wrapper<N> { inner: Array<f32, N> }`)
             // is laid out first and embedded as its own `!llvm.struct`.
             let (sz, al, mlir, kind) = match &fty {
+                // An enum instance held by value, `Peek<T> { peeked : Option<T> }`. The type may
+                // spell the enum as a struct, so it is found by name.
+                Type::GenericInstance(b, a)
+                    if matches!(b.as_ref(), Type::Enum(n, _) | Type::Struct(n, _)
+                        if self.registry.enum_data.contains_key(n.as_ref())) =>
+                {
+                    let (Type::Enum(inner_name, _) | Type::Struct(inner_name, _)) = b.as_ref()
+                    else {
+                        return None;
+                    };
+                    let (inner, offsets, payload) =
+                        self.enum_instance_layout_of(inner_name.as_ref(), a)?;
+                    let (mut end, mut al) = (4u64, 4u64);
+                    for (o, pt) in offsets.iter().skip(1).zip(&payload) {
+                        let (psz, pal, _) = self.payload_field(pt)?;
+                        end = o + psz;
+                        al = al.max(pal);
+                    }
+                    let tys = &self.agg_layouts.iter().find(|(g, _, _)| *g == inner)?.2;
+                    (
+                        crate::layout::align_up(end as usize, al as usize) as u64,
+                        al,
+                        format!("!llvm.struct<({})>", tys.join(", ")),
+                        FieldTy::Nominal(inner),
+                    )
+                }
                 Type::GenericInstance(b, a) if matches!(b.as_ref(), Type::Struct(..)) => {
                     let Type::Struct(inner_name, _) = b.as_ref() else {
                         return None;
@@ -3179,6 +3237,22 @@ impl<'r> Lowerer<'r> {
             self.agg_layouts.push((gid, offsets, field_tys));
         }
         Some(gid)
+    }
+
+    /// Whether `ty` borrows or points to a generic struct instance whose layout is synthesized
+    /// (`&Peek<i64>`), which the registry alone does not know.
+    fn borrows_a_struct_instance(&mut self, ty: &Type) -> bool {
+        let (Type::Borrow { inner, .. } | Type::Pointer(inner, ..)) = ty else {
+            return false;
+        };
+        let Type::GenericInstance(b, a) = inner.as_ref() else {
+            return false;
+        };
+        let Type::Struct(n, _) = b.as_ref() else {
+            return false;
+        };
+        agg_gid_of_ty(ty, self.registry).is_none()
+            && self.struct_instance_layout_of(n.as_ref(), a).is_some()
     }
 
     /// Synthesize (once) and record the aggregate layout of a monomorphized data-carrying enum
@@ -3278,9 +3352,8 @@ impl<'r> Lowerer<'r> {
             for (_, p) in &data.variants {
                 let Some(t) = p.get(i) else { continue };
                 let t = t.substitute(&mapping);
-                let Some((sz, al, _)) = self.payload_field(&t) else {
-                    continue;
-                };
+                // A missing payload can be skipped; an unsupported one invalidates the layout.
+                let (sz, al, _) = self.payload_field(&t)?;
                 let better = match &widest {
                     None => true,
                     Some((bsz, bal, _)) => (sz, al) > (*bsz, *bal),
@@ -3553,7 +3626,8 @@ impl<'r> Lowerer<'r> {
     /// `t.reshape([dims..])` and `t.transpose([perm..])` on a statically shaped tensor: a view
     /// with the new sizes over the same buffer, or the axes permuted, which the emitter copies
     /// into a fresh contiguous buffer, as the oracle does. The extents and the permutation are
-    /// literals; a `PadMode` argument is accepted and unused, as the oracle treats it.
+    /// literals. `PadMode::Trim` is a view like any reshape; `PadMode::Pad` and `t.pad([dims..])`
+    /// make a new tensor.
     fn lower_tensor_reshape(&mut self, mc: &crate::syntax::MethodCallExpr) -> Lowered<Val> {
         let src = self.lower_expr(&mc.base)?;
         let LoweredTy::Tensor { elem, shape } = &src.ty else {
@@ -3588,10 +3662,31 @@ impl<'r> Lowerer<'r> {
             );
         }
         let (elem, shape) = (elem.clone(), shape.clone());
+        if mc.method_name.as_ref() == "pad" {
+            if vals.len() != shape.len() {
+                return Err(Decline::TypeNotModelled {
+                    what: "a pad that changes the number of axes",
+                });
+            }
+            let shape = vals.iter().map(|v| v.to_string()).collect();
+            let ty = LoweredTy::Tensor { elem, shape };
+            return Ok(self.emit_typed(
+                Opcode::TensorPad,
+                src.reg,
+                Register(0),
+                ty,
+                crate::bytecode::TENSOR_PAD_EACH_AXIS,
+            ));
+        }
         if mc.method_name.as_ref() != "transpose" {
             let shape = vals.iter().map(|v| v.to_string()).collect();
             let ty = LoweredTy::Tensor { elem, shape };
-            return Ok(self.emit_typed(Opcode::TensorReshape, src.reg, Register(0), ty, 0));
+            let op = if mc.is_padding_reshape() {
+                Opcode::TensorPad
+            } else {
+                Opcode::TensorReshape
+            };
+            return Ok(self.emit_typed(op, src.reg, Register(0), ty, 0));
         }
         let rank = shape.len();
         let mut seen = vec![false; rank];
@@ -3802,7 +3897,7 @@ impl<'r> Lowerer<'r> {
         if values.len() != count || count == 0 {
             return None;
         }
-        let bytes = (crate::hir::memory::element_bits(elem)? * count as u64).div_ceil(8);
+        let bytes = crate::hir::memory::element_bytes(elem)? * count as u64;
         let shape_s: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
         let buf = self.emit_typed(
             Opcode::TensorAlloc,
@@ -3874,10 +3969,9 @@ impl<'r> Lowerer<'r> {
             } // only scalar-element arrays are modelled
         };
         let n = vals.len();
-        let bytes = (crate::hir::memory::element_bits(&elem).ok_or(Decline::TypeNotModelled {
+        let bytes = crate::hir::memory::element_bytes(&elem).ok_or(Decline::TypeNotModelled {
             what: "an element type with no known width",
-        })? * n as u64)
-            .div_ceil(8);
+        })? * n as u64;
         let buf = self.emit_typed(
             Opcode::TensorAlloc,
             Register(0),
@@ -4502,7 +4596,19 @@ impl<'r> Lowerer<'r> {
         // pointer, so always a `PtrStore`). (#242)
         if let Expr::Dereference(_) = lhs {
             let place = self.lower_place(lhs)?;
-            let value = self.lower_expr(rhs)?;
+            let mut value = self.lower_expr(rhs)?;
+            // A struct or enum built in place yields its slot; the place holds the value.
+            if construction_tail(rhs) && matches!(value.ty, LoweredTy::Aggregate(_)) {
+                value = self.emit_typed(
+                    Opcode::SlotLoad,
+                    value.reg,
+                    Register(0),
+                    value.ty.clone(),
+                    0,
+                );
+            }
+            // The old value's drops run now that the new value is computed, before it is stored.
+            self.run_value_drops()?;
             self.emit_effect(Opcode::PtrStore, place.reg, value.reg, 0);
             return Ok(());
         }
@@ -4523,12 +4629,19 @@ impl<'r> Lowerer<'r> {
                     what: "a field not in the modelled layout",
                 })?;
             let offset = field.offset as u64;
-            if matches!(field.ty, FieldTy::Nominal(_)) {
+            let nested =
+                matches!(field.ty, FieldTy::Nominal(n) if !self.registry.is_payload_free_enum(n));
+            if nested && !construction_tail(rhs) {
                 return Err(Decline::TypeNotModelled {
                     what: "a store to a nested nominal field",
                 });
             }
-            let v = self.lower_expr(rhs)?;
+            let mut v = self.lower_expr(rhs)?;
+            // A struct or enum built in place yields its slot; the field holds the value.
+            if nested && matches!(v.ty, LoweredTy::Aggregate(_)) {
+                v = self.emit_typed(Opcode::SlotLoad, v.reg, Register(0), v.ty.clone(), 0);
+            }
+            self.run_value_drops()?;
             let pos = self.code.len();
             self.emit_effect(Opcode::FieldStore, base_reg, v.reg, offset);
             // A place-write field store (`*r = v` through a `&mut o.field` place): record it for
@@ -4677,6 +4790,7 @@ impl<'r> Lowerer<'r> {
                 | Opcode::MatmulInto
                 | Opcode::TensorClone
                 | Opcode::TensorTranspose
+                | Opcode::TensorPad
                 | Opcode::TensorMap
                 | Opcode::TensorReduce
                 | Opcode::TensorDim
@@ -4876,8 +4990,8 @@ impl<'r> Lowerer<'r> {
             Statement::Return(r) => {
                 // `return <match>` (a value-position match whose arms `return` themselves, e.g.
                 // `Option::unwrap`): lower the match as a statement — each arm emits its own `Ret` — then
-                // give the fall-through merge block a terminator, a default (zero) return of the
-                // function's type, exactly as the AST codegen's merge block does. (#242)
+                // give the fall-through merge block a terminator: a default (zero) return of the
+                // function's type, or for a struct or enum, an abort. (#242)
                 if let Some(Expr::Match(m)) = &r.expr {
                     // The zero below is a fall-through default, correct when nothing reaches the
                     // merge block carrying a value -- `Option::unwrap`'s `None` arm ends in an
@@ -4909,6 +5023,22 @@ impl<'r> Lowerer<'r> {
                                 e.clone(),
                                 0,
                             ),
+                            // A struct or enum has no zero to return. Stop the program instead,
+                            // and give `Ret` an unwritten slot, which is never read.
+                            LoweredTy::Aggregate(_) => {
+                                let never = self.emit_value(
+                                    Opcode::Const,
+                                    Register(0),
+                                    Register(0),
+                                    ElementType::Bool,
+                                    0,
+                                );
+                                let imm = self.strings.len() as u64;
+                                self.strings
+                                    .push("no arm of the match returned a value".to_string());
+                                self.emit_effect(Opcode::Abort, never.reg, Register(0), imm);
+                                self.emit_alloca(rty.clone())
+                            }
                             _ => {
                                 return Err(Decline::TypeNotModelled {
                                     what: "a non-scalar default return",
@@ -4929,6 +5059,14 @@ impl<'r> Lowerer<'r> {
                     return Ok(());
                 };
                 let v = self.lower_expr(ret_expr)?;
+                if self.ret_void {
+                    if !self.block_terminated() {
+                        self.run_value_drops()?;
+                        self.drop_temps_here(None);
+                        self.emit_effect(Opcode::Ret, Register(0), Register(0), 0);
+                    }
+                    return Ok(());
+                }
                 // A transparent block can carry the return itself: `return comptime { ..;
                 // return x; }` is a synthesized closure body's shape, and its inner `return`
                 // already ended the block. A second Ret -- or any op after the first -- is
@@ -4947,6 +5085,21 @@ impl<'r> Lowerer<'r> {
             // Compound assignment `lhs op= rhs` desugars to `lhs = (lhs op rhs)`: read the current
             // value of the place, combine it with the right side, and store back.
             Statement::CompoundAssign(a) => {
+                // `p.x += n` and `*r += n` are `p.x = p.x + n` and `*r = *r + n`, which
+                // `lower_assign` already handles. The place is named twice, so only a variable
+                // followed by fields and `*`, where naming it twice cannot run anything twice.
+                if matches!(&a.lhs, Expr::MemberAccess(_) | Expr::Dereference(_))
+                    && named_without_side_effects(&a.lhs)
+                {
+                    let value = Expr::BinaryOp(crate::syntax::expr::BinaryOpExpr {
+                        lhs: Box::new(a.lhs.clone()),
+                        op: a.op.clone(),
+                        rhs: Box::new(a.rhs.clone()),
+                        span: a.span,
+                        operand_ty: a.operand_ty.clone(),
+                    });
+                    return self.lower_assign(&a.lhs, &value);
+                }
                 let cur = self.lower_expr(&a.lhs)?;
                 let rhs = self.lower_expr(&a.rhs)?;
                 let op = binop_opcode(&a.op).ok_or(Decline::Unsupported {
@@ -5063,7 +5216,7 @@ impl<'r> Lowerer<'r> {
                     Ok(())
                 }
                 Expr::FunctionCall(fc) if fc.name.as_ref() == "print" && fc.args.len() == 1 => {
-                    let v = self.lower_expr(&fc.args[0])?;
+                    let v = self.lower_expr(Self::print_operand(&fc.args[0]))?;
                     self.emit_print(v)?;
                     Ok(())
                 }
@@ -5185,6 +5338,7 @@ fn try_lower<'r>(func: &Function, registry: &'r ImmutableGlobalRegistry) -> Lowe
         .any(|(_, ty)| matches!(lowered_ty(ty, registry), Some(LoweredTy::Aggregate(_))));
     lw.memory = lw.has_control_flow || has_aggregate_param || body_constructs_struct(&func.body);
     lw.ret_ty = lw.lower_ty_synth(&func.return_type);
+    lw.ret_void = crate::syntax::is_void_ty(&func.return_type);
     if lw.memory {
         lw.emit_effect(Opcode::BlockStart, Register(0), Register(0), 0); // entry block
     }
@@ -5210,7 +5364,10 @@ fn try_lower<'r>(func: &Function, registry: &'r ImmutableGlobalRegistry) -> Lowe
         // value that binds as an SSA register even in memory mode: it is a block argument that
         // dominates every block, and mutation flows through the pointer to the pointee, not to the
         // register (so it never needs a slot). (#242)
-        if matches!(incoming.ty, LoweredTy::Tensor { .. }) || is_ptr_to_agg(ty, registry) {
+        if matches!(incoming.ty, LoweredTy::Tensor { .. })
+            || is_ptr_to_agg(ty, registry)
+            || lw.borrows_a_struct_instance(ty)
+        {
             lw.scope.insert(name.clone(), Binding::Reg(incoming));
         } else {
             lw.bind_local(name.clone(), incoming);
@@ -5881,6 +6038,17 @@ fn simple_ident(e: &Expr) -> Option<Symbol> {
     }
 }
 
+/// A variable followed by fields and `*`, like `p.x` or `*r` or `(*self).pos.x`: naming it
+/// evaluates nothing, so it can be named twice.
+fn named_without_side_effects(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(_) => true,
+        Expr::MemberAccess(m) => named_without_side_effects(&m.base),
+        Expr::Dereference(d) => named_without_side_effects(&d.expr),
+        _ => false,
+    }
+}
+
 /// Parse a monomorphized enum instance name into its base name + type arguments: `"Option<i32>"` ->
 /// `("Option", [i32])`, `"Color"` -> `("Color", [])`. Type args are parsed as scalars (else a nominal
 /// The name before the type arguments: `"Option<i32>"` -> `"Option"`.
@@ -6275,6 +6443,7 @@ fn makes_a_fresh_tensor(opcode: Opcode) -> bool {
             | Opcode::Matmul
             | Opcode::TensorClone
             | Opcode::TensorTranspose
+            | Opcode::TensorPad
             | Opcode::TensorMap
     )
 }
@@ -6295,15 +6464,17 @@ fn only_scratch_drops_after(stmts: &[Statement], idx: usize) -> bool {
 /// concurrent device threads instead of one (#251)?
 ///
 /// Splitting a loop across threads is only sound when no iteration can observe another. The proof
-/// obligation is entirely about **writes to captured memory** — everything a thread declares
-/// itself is thread-private on a GPU by construction (an entry-block alloca is in the thread's own
-/// local depot, so even the region's pre-loop scratch declarations replicate harmlessly). So the
-/// rule this walker enforces, conservatively and syntactically, is:
+/// obligation is about **captured memory** — everything a thread declares itself is
+/// thread-private on a GPU by construction (an entry-block alloca is in the thread's own local
+/// depot, so even the region's pre-loop scratch declarations replicate harmlessly). So the rule
+/// this walker enforces, conservatively and syntactically, is:
 ///
 /// - the region is `[zero or more local declarations] for iv in lo..hi { body }` and nothing else,
 ///   with literal integer bounds (the trip count sizes the launch);
 /// - every write in the body lands either in a name declared inside the region, or in a captured
 ///   tensor indexed **first by `iv`** — each iteration then owns row `iv` and no other;
+/// - a captured tensor the body writes is read only at the iteration's own row, since any other
+///   row may be another iteration's, written at the same time;
 /// - nothing in the body can write through a side door: no free calls, no prints, no transfers, no
 ///   nested spawns, no method calls rooted at a captured name (a `&mut self` method on captured
 ///   state is a write this walker cannot see);
@@ -6369,7 +6540,7 @@ fn parallel_outer_for(stmts: &[Statement]) -> Option<(usize, u64)> {
     if !scan.declare(&f.iter) {
         return None;
     }
-    if scan.stmts(&f.body, 0) {
+    if scan.stmts(&f.body, 0) && !scan.passes_may_share_rows() {
         Some((idx, (hi - lo) as u64))
     } else {
         None
@@ -6484,7 +6655,7 @@ fn parallel_two_level(stmts: &[Statement]) -> Option<(u64, TwoLevelPlan)> {
     if !walker.items(&f.body) || !walker.items(&f.body) {
         return None;
     }
-    if !walker.saw_thread_loop {
+    if !walker.saw_thread_loop || walker.scan.passes_may_share_rows() {
         return None;
     }
     let threads = walker.max_thread_trip.clamp(1, 1024) as u64;
@@ -6737,6 +6908,7 @@ fn parallel_pure_call(name: &str) -> bool {
         && matches!(
             method,
             "exp"
+                | "fast_exp"
                 | "exp2"
                 | "sqrt"
                 | "abs"
@@ -6747,6 +6919,7 @@ fn parallel_pure_call(name: &str) -> bool {
                 | "cos"
                 | "tan"
                 | "tanh"
+                | "fast_tanh"
                 | "floor"
                 | "ceil"
                 | "round"
@@ -6758,8 +6931,33 @@ fn parallel_pure_call(name: &str) -> bool {
         )
 }
 
-/// The write-disjointness walk behind `parallel_outer_for`. `declared` and `used_captured` grow in
-/// program order; every `false` means "reject the region", never an error.
+/// An index expression written out without spans, with the operands of `+` and `*` in a fixed
+/// order, so `lo + i` and `i + lo` are one key, and the loop's own variable written `$iv`, so two
+/// loops of one kernel over the same rows agree. `None` for anything else, which `owns_row` never
+/// accepts as a row.
+fn index_key(e: &Expr, iv: &str) -> Option<String> {
+    match e {
+        Expr::Identifier(id) if *id.name == *iv => Some("$iv".to_string()),
+        Expr::Identifier(id) => Some(id.name.to_string()),
+        Expr::Number(n) => Some(n.value.to_string()),
+        Expr::BinaryOp(b) => {
+            let (l, r) = (index_key(&b.lhs, iv)?, index_key(&b.rhs, iv)?);
+            let op = match b.op {
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                _ => return None,
+            };
+            let (l, r) = if op != "-" && r < l { (r, l) } else { (l, r) };
+            Some(format!("({l}{op}{r})"))
+        }
+        _ => None,
+    }
+}
+
+/// The disjointness walk behind `parallel_outer_for`: what each iteration writes, and what it reads
+/// of what is written. `declared` and `used_captured` grow in program order; every `false` means
+/// "reject the region", never an error.
 struct ParallelScan {
     iv: String,
     declared: HashSet<String>,
@@ -6779,6 +6977,16 @@ struct ParallelScan {
     /// barrier as the next statement.
     smem_written: HashSet<String>,
     smem_nonown_read: HashSet<String>,
+    /// Tensors from outside the region that it writes, and those it reads at a row the reading
+    /// iteration may not own. A tensor in both is a race: one iteration reads a row another may
+    /// be writing.
+    captured_written: HashSet<String>,
+    captured_nonown_read: HashSet<String>,
+    /// For each tensor from outside the region, the first index of every access that reads or
+    /// writes a row its pass owns, written out without spans. A written tensor reached through
+    /// two different first indices, such as `o[i]` and `o[lo + i]`, is a race: one pass's
+    /// `lo + i` is another pass's `i`.
+    row_keys: HashMap<String, HashSet<String>>,
     /// Set while scanning a COOPERATIVE thread loop (Vx#379 stage C): admits `barrier()` as a
     /// statement (under the divergence guards below) and arms the seam checks.
     coop: bool,
@@ -6801,6 +7009,9 @@ impl ParallelScan {
             smem: HashSet::new(),
             smem_written: HashSet::new(),
             smem_nonown_read: HashSet::new(),
+            captured_written: HashSet::new(),
+            captured_nonown_read: HashSet::new(),
+            row_keys: HashMap::new(),
             coop: false,
             barrier_ok: false,
             loop_barrier_stack: Vec::new(),
@@ -6995,12 +7206,76 @@ impl ParallelScan {
                     return matches!(first, Expr::Identifier(fid) if *fid.name == *self.iv);
                 }
                 self.note(&id.name);
-                matches!(first, Expr::Identifier(fid) if *fid.name == *self.iv)
-                    || self.affine_first(first)
-                    || self.block_row_write(&indices)
+                self.captured_written.insert(id.name.to_string());
+                if !self.owns_row(&indices) {
+                    return false;
+                }
+                self.record_row(&id.name, first);
+                true
             }
             _ => false,
         }
+    }
+
+    /// Note which row of `name` an access the current pass owns goes to; see `row_keys`.
+    fn record_row(&mut self, name: &str, first: &Expr) {
+        if let Some(key) = index_key(first, &self.iv) {
+            self.row_keys
+                .entry(name.to_string())
+                .or_default()
+                .insert(key);
+        }
+    }
+
+    /// `iv + e`, `e + iv`, `iv - e` or `e - iv`, where `e` does not change during the loop: it
+    /// is made of numbers and names from outside the region, which the region cannot write
+    /// (`target` refuses a write to one). Each pass then reaches a different row.
+    fn offset_first(&self, e: &Expr) -> bool {
+        let Expr::BinaryOp(b) = e else {
+            return false;
+        };
+        if !matches!(b.op, BinaryOp::Add | BinaryOp::Sub) {
+            return false;
+        }
+        let is_iv = |x: &Expr| matches!(x, Expr::Identifier(id) if *id.name == *self.iv);
+        (is_iv(&b.lhs) && self.loop_invariant(&b.rhs))
+            || (is_iv(&b.rhs) && self.loop_invariant(&b.lhs))
+    }
+
+    /// Whether `e` has the same value on every pass: numbers, and names from outside the region.
+    fn loop_invariant(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Number(_) => true,
+            Expr::Identifier(id) => *id.name != *self.iv && !self.declared.contains(&*id.name),
+            Expr::BinaryOp(b) => {
+                matches!(b.op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                    && self.loop_invariant(&b.lhs)
+                    && self.loop_invariant(&b.rhs)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the index chain `indices` (outermost-last, as `target` collects it) names a row
+    /// the current iteration owns: first index the IV, or one of the two-level ownership forms.
+    fn owns_row(&self, indices: &[&Expr]) -> bool {
+        let Some(first) = indices.last() else {
+            return false;
+        };
+        matches!(first, Expr::Identifier(fid) if *fid.name == *self.iv)
+            || self.offset_first(first)
+            || self.affine_first(first)
+            || self.block_row_write(indices)
+    }
+
+    /// Whether two passes may reach the same row of a tensor from outside the region that the
+    /// loop writes: one reads a row the reading pass may not own, or the tensor is reached
+    /// through two different first indices.
+    fn passes_may_share_rows(&self) -> bool {
+        self.captured_written.iter().any(|name| {
+            self.captured_nonown_read.contains(name)
+                || self.row_keys.get(name).is_some_and(|keys| keys.len() > 1)
+        })
     }
 
     /// The third captured-write ownership form (Vx#379 R3): the BLOCK owns the row and the
@@ -7081,8 +7356,12 @@ impl ParallelScan {
     /// transfer) or is a construct this walk has no sound story for.
     fn expr(&mut self, e: &Expr) -> bool {
         match e {
+            // A name read whole may read every row of it.
             Expr::Identifier(id) => {
                 self.note(&id.name);
+                if !self.declared.contains(&*id.name) {
+                    self.captured_nonown_read.insert(id.name.to_string());
+                }
                 true
             }
             Expr::Number(_) | Expr::StringLiteral(_) | Expr::SizeOf(_) | Expr::EnumVariant(_) => {
@@ -7093,37 +7372,47 @@ impl ParallelScan {
             Expr::LogicalOp(b) => self.expr(&b.lhs) && self.expr(&b.rhs),
             Expr::UnaryOp(u) => self.expr(&u.expr),
             Expr::AsCast(c) => self.expr(&c.expr),
-            Expr::IndexAccess(ix) => {
+            Expr::IndexAccess(_) => {
+                let mut root = e;
+                let mut indices = Vec::new();
+                while let Expr::IndexAccess(step) = root {
+                    indices.push(&*step.index);
+                    root = &step.base;
+                }
+                let Expr::Identifier(id) = root else {
+                    return self.expr(root) && indices.iter().all(|i| self.expr(i));
+                };
                 // Ledger for the same-loop shared read/write race check (Vx#379 stage B): a
                 // read of a block-shared tensor at a row other than the thread loop's own IV.
                 // Reading a neighbour's row is exactly what a consume phase does to a tile the
                 // FILL phase wrote -- legal across a barrier, a race within one loop.
-                if self.affine.is_some() {
-                    let mut root = e;
-                    let mut indices = Vec::new();
-                    while let Expr::IndexAccess(step) = root {
-                        indices.push(&*step.index);
-                        root = &step.base;
-                    }
-                    if let Expr::Identifier(id) = root {
-                        if self.smem.contains(&*id.name) {
-                            let own = matches!(
-                                indices.last(),
-                                Some(Expr::Identifier(fid)) if *fid.name == *self.iv
-                            );
-                            if !own {
-                                // The read-after-write seam: a neighbour's row of a tensor
-                                // written since the last barrier -- the fill may not be
-                                // visible yet. Legal only across a barrier.
-                                if self.smem_written.contains(&*id.name) {
-                                    return false;
-                                }
-                                self.smem_nonown_read.insert(id.name.to_string());
-                            }
+                if self.affine.is_some() && self.smem.contains(&*id.name) {
+                    let own = matches!(
+                        indices.last(),
+                        Some(Expr::Identifier(fid)) if *fid.name == *self.iv
+                    );
+                    if !own {
+                        // The read-after-write seam: a neighbour's row of a tensor
+                        // written since the last barrier -- the fill may not be
+                        // visible yet. Legal only across a barrier.
+                        if self.smem_written.contains(&*id.name) {
+                            return false;
                         }
+                        self.smem_nonown_read.insert(id.name.to_string());
                     }
                 }
-                self.expr(&ix.base) && self.expr(&ix.index)
+                // A row of a tensor from outside the region that this iteration may not own.
+                if !self.declared.contains(&*id.name) {
+                    if self.owns_row(&indices) {
+                        if let Some(first) = indices.last() {
+                            self.record_row(&id.name, first);
+                        }
+                    } else {
+                        self.captured_nonown_read.insert(id.name.to_string());
+                    }
+                }
+                self.note(&id.name);
+                indices.iter().all(|i| self.expr(i))
             }
             Expr::MemberAccess(m) => self.expr(&m.base),
             Expr::Array(a) => a.elements.iter().all(|el| self.expr(el)),
@@ -7767,6 +8056,38 @@ mod tests {
         assert_eq!(
             result_gid(&w, Opcode::TensorAlloc),
             tensor_gid(&ElementType::F32, &["2".to_string(), "4".to_string()]),
+        );
+        verify_hir_stream(&w);
+    }
+
+    #[test]
+    fn a_bool_tensor_takes_a_byte_per_element() {
+        let f = parse_fn(
+            "fn f() -> Tensor<bool, [3]> \
+             { let o : Tensor<bool, [3]> = [true, false, true]; return o; }",
+        );
+        let mut w = worker();
+        lower_function_to_hir(&f, &mut w).expect("a bool literal should lower");
+        assert_eq!(
+            op_imm(&w, Opcode::TensorAlloc),
+            Some(3),
+            "3 bools are 3 bytes"
+        );
+        verify_hir_stream(&w);
+    }
+
+    #[test]
+    fn a_nested_bool_initializer_takes_a_byte_per_element() {
+        let f = parse_fn(
+            "fn f() -> Tensor<bool, [2, 3]> \
+             { let o = Tensor<bool>([[true, false, true], [false, true, false]]); return o; }",
+        );
+        let mut w = worker();
+        lower_function_to_hir(&f, &mut w).expect("a nested bool literal should lower");
+        assert_eq!(
+            op_imm(&w, Opcode::TensorAlloc),
+            Some(6),
+            "6 bools are 6 bytes"
         );
         verify_hir_stream(&w);
     }
@@ -9040,6 +9361,194 @@ mod tests {
         assert_eq!(end.imm, 0, "a fixed-row write is not disjoint");
     }
 
+    /// The `SpawnEnd` of the only spawn region in `main` of `src`: its trip count when the region
+    /// runs in parallel, 0 when it stays serial.
+    fn spawn_trip(src: &str) -> u64 {
+        let (did, w) = lower_with_registry(src, "main");
+        assert!(did, "the region lowers on the flat path");
+        w.local_hir_stream
+            .iter()
+            .find(|i| i.opcode == Opcode::SpawnEnd)
+            .expect("a SpawnEnd")
+            .imm
+    }
+
+    #[test]
+    fn a_write_at_an_offset_from_the_loop_variable_still_strides() {
+        // `lo` is fixed for the whole loop, so `lo + r` is a different row on every pass.
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([1024, 1]);\n\
+               let lo = 512;\n\
+               spawn on (Topology::GPU) {\n\
+                 for r in 0..512 {\n\
+                   o[lo + r][0] = o[lo + r][0] + 2.0;\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(trip, 512, "an offset row is the pass's own row");
+    }
+
+    #[test]
+    fn a_tensor_reached_through_two_row_forms_stays_serial() {
+        // Pass `r` reads row `r`, which pass `r - lo` writes.
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([1024, 1]);\n\
+               let lo = 512;\n\
+               spawn on (Topology::GPU) {\n\
+                 for r in 0..512 {\n\
+                   o[lo + r][0] = o[r][0];\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(
+            trip, 0,
+            "`o[r]` and `o[lo + r]` are rows of different passes"
+        );
+    }
+
+    #[test]
+    fn two_writes_through_different_offsets_stay_serial() {
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([1024, 1]);\n\
+               let lo = 512;\n\
+               spawn on (Topology::GPU) {\n\
+                 for r in 0..512 {\n\
+                   o[r][0] = 1.0;\n\
+                   o[lo + r][0] = 2.0;\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(
+            trip, 0,
+            "pass `r` writes rows `r` and `lo + r`, and pass `r + lo` writes row `r + lo`"
+        );
+    }
+
+    #[test]
+    fn an_offset_made_inside_the_loop_stays_serial() {
+        // `k` is a local of the loop, so `k + r` need not be a different row on every pass.
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([1024, 1]);\n\
+               spawn on (Topology::GPU) {\n\
+                 for r in 0..512 {\n\
+                   let k = 511 - r;\n\
+                   o[k + r][0] = 1.0;\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(
+            trip, 0,
+            "an offset that changes with the pass is not a row the pass owns"
+        );
+    }
+
+    #[test]
+    fn two_thread_loops_over_the_same_rows_keep_the_two_level_plan() {
+        // The two thread loops have their own variables, `qi` and `qj`, but `bq * 4 + qi` and
+        // `bq * 4 + qj` are the same row for the same thread: one row form, not two.
+        let imm = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([8, 4]);\n\
+               spawn on (Topology::GPU) {\n\
+                 for bq in 0..2 {\n\
+                   for qi in 0..4 {\n\
+                     o[bq * 4 + qi][0] = 1.0;\n\
+                   }\n\
+                   barrier();\n\
+                   for qj in 0..4 {\n\
+                     o[bq * 4 + qj][1] = 2.0;\n\
+                   }\n\
+                   barrier();\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_ne!(
+            imm & SPAWN_TWO_LEVEL,
+            0,
+            "the two loops reach the same rows"
+        );
+    }
+
+    #[test]
+    fn a_read_of_another_iterations_row_keeps_the_region_serial() {
+        // Iteration `i` reads row `i + 1`, which iteration `i + 1` writes: split across
+        // workers, the read races with that write.
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([5, 8]);\n\
+               spawn on (Topology::GPU) {\n\
+                 for i in 0..4 {\n\
+                   for d in 0..8 {\n\
+                     o[i][d] = o[i + 1][d];\n\
+                   }\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(
+            trip, 0,
+            "a read of a row another iteration writes is not disjoint"
+        );
+    }
+
+    #[test]
+    fn a_whole_read_of_a_written_tensor_keeps_the_region_serial() {
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([4, 8]);\n\
+               spawn on (Topology::GPU) {\n\
+                 for i in 0..4 {\n\
+                   let all = o;\n\
+                   o[i][0] = 1.0;\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(
+            trip, 0,
+            "reading the whole tensor reads every iteration's row"
+        );
+    }
+
+    #[test]
+    fn reads_of_the_own_row_and_of_unwritten_tensors_still_stride() {
+        // `o` is read only at row `i`, and `w` at any row, since nothing in the loop writes `w`.
+        let trip = spawn_trip(
+            "fn main() -> i32 {\n\
+               let mut o = Tensor<f32>([4, 8]);\n\
+               let w = Tensor<f32>([5, 8]);\n\
+               spawn on (Topology::GPU) {\n\
+                 for i in 0..4 {\n\
+                   for d in 0..8 {\n\
+                     o[i][d] = o[i][d] + w[i + 1][d];\n\
+                   }\n\
+                 }\n\
+               };\n\
+               return 0;\n\
+             }",
+        );
+        assert_eq!(
+            trip, 4,
+            "own-row reads and reads of unwritten tensors are disjoint"
+        );
+    }
+
     #[test]
     fn spawn_wraps_body_in_region_markers() {
         let f = parse_fn(
@@ -9057,7 +9566,7 @@ mod tests {
             .find(|i| i.opcode == Opcode::Spawn)
             .unwrap();
         assert_eq!(
-            spawn.imm,
+            spawn.imm & 0xffff_ffff,
             crate::arch::topology_dispatch_id(&crate::syntax::Topology::gpu(0)) as u64
         );
         assert!(

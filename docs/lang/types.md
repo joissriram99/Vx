@@ -115,6 +115,39 @@ fn matmul(A: Tensor<f32, [M, K]>, B: Tensor<f32, [K, N]>) -> Tensor<f32, [M, N]>
 
 If dimensions are statically evaluated to mismatch, the compiler will refuse to compile, effectively removing zero-day out-of-bounds runtime errors for standard tensor operations.
 
+### Changing a tensor's shape
+
+For `t : Tensor<f32, [2, 2]>` holding `a b / c d`:
+
+| Call | Result | A view of `t`? |
+| --- | --- | --- |
+| `t.reshape([4])` | `a b c d` | yes |
+| `t.reshape([3], PadMode::Trim)` | `a b c` | yes |
+| `t.reshape([3, 3], PadMode::Pad)` | `a b c / d 0 0 / 0 0 0` | no, a new tensor |
+| `t.pad([3, 3])` | `a b 0 / c d 0 / 0 0 0` | no, a new tensor |
+
+- `reshape` reads the elements in row order. Without a mode, the new shape has the same number
+  of elements.
+- `PadMode::Trim` keeps the first elements. `PadMode::Pad` keeps them all and adds zeros at the
+  end. `PadMode` is declared in `std::tensor`.
+- `pad` keeps each element at its index, `big[i][j] == t[i][j]`, and adds zeros at the end of
+  every axis. The new shape has the same number of axes, and no axis is smaller.
+- A view borrows `t`. A new tensor does not, so `t` can change or move while it lives.
+- All sizes must be known while compiling. `PadMode::Pad` and `pad` of a tensor placed in a
+  memory space are not supported yet.
+
+```rust
+import std::tensor;
+
+fn shapes(t : Tensor<f32, [2, 2]>) -> f32 {
+  let flat : Tensor<f32, [4]> = t.reshape([4]);
+  let first : Tensor<f32, [3]> = t.reshape([3], PadMode::Trim);
+  let longer : Tensor<f32, [3, 3]> = t.reshape([3, 3], PadMode::Pad);
+  let bigger : Tensor<f32, [3, 3]> = t.pad([3, 3]);
+  return flat[0] + first[0] + longer[2][2] + bigger[2][2];
+}
+```
+
 ## 3. Hardware-Aware Typestates
 
 Vx models the non-deterministic nature of distributed, heterogeneous execution using typestates. Computations and tasks are typed based on their topological binding and availability.
@@ -287,7 +320,7 @@ are written once and the constructor takes no arguments:
 let x = Tensor<f32, [8, 8], Memory::NPU_HBM>::new();
 
 // Not initialized -- the caller undertakes to write every element before reading one
-let y = Tensor<f32, [8, 8], Memory::NPU_HBM>::uninit();
+let y = unsafe { Tensor<f32, [8, 8], Memory::NPU_HBM>::uninit() };
 
 // Runtime extents, so they stay an argument
 let z = Tensor<f32, [?, ?], Memory::NPU_HBM>::new([rows, cols]);
@@ -299,6 +332,10 @@ domain that is the common case rather than the exception — a decoder that mate
 matrix and fills it immediately would pay for the zeroing on every token. `::new()` is the one to
 reach for otherwise: a name that promises a valid value should deliver one, and `uninit` is
 greppable when a garbage-value bug is being hunted.
+
+`::uninit()` belongs inside `unsafe`, because the compiler cannot check that every element is
+written before it is read. Outside `unsafe` it is warned about (W1032), and a later version will
+refuse it.
 
 A `Tensor`'s extents are part of its type, so every one of them has to be known at compile time —
 a literal or a const generic. An extent that is a run-time value is refused, naming the `?` spelling,
@@ -321,13 +358,54 @@ In Vx, `is_assignable` is purely a **Type Compatibility Checker**. It determines
 When verifying `let target: TargetType = source_expression;`, the compiler permits the following structural coercions:
 
 1. **Strict Equality:** If the resolved `Target` and `Source` types are identical, the assignment is valid.
-1. **Implicit Unwrapping:** A hardware-specific wrapper type can implicitly decay to its base type. For example, `Ref<T>` or `Pinned<T>` can be safely assigned to a variable explicitly requesting a raw `T`.
-1. **Literal Broadcasting (Scalar to Tensor):** Scalar numerical literals (e.g., `1.0` or `42`) can be implicitly coerced and broadcasted into `Tensor<T>` configurations, provided they are not boolean mismatches.
-1. **Numeric Scalar Coercions:** Standard numeric types are permitted to automatically coerce across differing precisions (e.g., `f64` to `f32`) to accommodate literals during compilation, ensuring mathematical continuity without verbose casting.
-1. **Pointer Decay:** Safe borrows (`&mut T`) implicitly decay into raw unsafe pointers (`*mut T`) when crossing FFI or unsafe boundaries.
-1. **Safety Coercions:** A `Ref<T, HostDRAM>` can be coerced into a `Verified<T>` boundary type, signaling that host memory access requires no further spatial validation.
+1. **Number Literals:** A number literal takes the numeric type its place expects: `let b : f32 = 1.5;` and `let c : u8 = 7;` are valid. A value that already has a type is not converted: an `f64` variable does not fit an `f32`, and an `i32` variable does not fit an `i64`. Write `as` for those (`a as f32`). In an array literal, the first element that is not a number literal sets the element type, so `[1.0, d]` is a `Tensor<f64, [2]>` when `d : f64`, and every other typed element must already have that type.
+1. **Scalar to Rank 0 Tensor:** A scalar fits a rank 0 tensor of the same element type: `let t : Tensor<i32, []> = 1;`. It does not fit a tensor with a shape: `let t : Tensor<f32, [4]> = 1.0;` is E3023, and `Tensor<f32, [4]>::fill(1.0)` says it instead.
+1. **Borrow to Raw Pointer:** A borrow fits a raw pointer to the same type: `&mut T` fits `*mut T` or `*const T`, and `&T` fits `*const T`. A `&T` does not fit `*mut T`.
+1. **Dropping `mut`:** `&mut T` fits `&T`, and `*mut T` fits `*const T`. A raw pointer to `i8` fits a raw pointer to any type, and the other way round, as `void *` does in C.
+1. **Never:** A value of type `!`, such as a call to a function that never returns, fits any type.
+
+These are refused, and the compiler says so with E3001:
+
+- **`Pinned<T>` to `T`.** A value on a device does not turn into a plain value. Move it with `transfer(x, Memory::CPU_DRAM)`.
+- **`T` to `Verified<T>`.** A `Verified<T>` is built with `Verified(x)`, and fits only another `Verified<U>` whose `U` fits `T`.
 
 If the types pass the `is_assignable` constraint matrix, the Semantic Analyzer accepts the program. Advanced lifecycle validation (like borrow constraints) operates entirely independently of this type-compatibility pass.
+
+### Tensor shapes
+
+A tensor value fits a tensor type when all of these hold:
+
+- **The element type is the same.** There is no numeric coercion between tensors: a
+  `Tensor<f32, [4]>` does not fit `Tensor<f64, [4]>`.
+- **The rank is the same.** No assignment changes the number of dimensions; use `reshape` for that.
+- **Each dimension fits.** A `?` in the target accepts any extent. A number in the target accepts
+  only the same number, and does not accept a `?`. So a known extent widens to `?`, but a `?` does
+  not narrow back to a known extent.
+- **The placement fits.** A type with no `Memory::` accepts a tensor in `CPU_DRAM`, and refuses one
+  in any other space.
+
+`Tensor<T, []>` has rank 0: it is a single value, not "any shape". `Tensor<f32>` with no shape at all
+does not parse.
+
+```vx
+fn main() -> i32 {
+  let a = Tensor<f32, [512, 8]>::new();
+  let b : Tensor<f32, [512, 8]> = a;  // same type
+  let c : Tensor<f32, [?, 8]> = b;    // 512 widens to ?
+  let d : Tensor<f32, [?, ?]> = c;    // any extent fits ?
+  return 0;
+}
+```
+
+Each of these is refused with E3001:
+
+| Assignment | Why |
+| --- | --- |
+| `let x : Tensor<f32, [512, 8]> = c;` with `c : Tensor<f32, [?, 8]>` | `?` does not narrow to `512` |
+| `let x : Tensor<f32, [4, 3]> = t;` with `t : Tensor<f32, [4, 4]>` | the extents differ |
+| `let x : Tensor<f32, [16]> = t;` with `t : Tensor<f32, [4, 4]>` | the ranks differ |
+| `let x : Tensor<f32, []> = t;` with `t : Tensor<f32, [4, 4]>` | rank 0 is not rank 2 |
+| `let x : Tensor<f64, [4]> = t;` with `t : Tensor<f32, [4]>` | the element types differ |
 
 ## 8. Primitive Types and Arrays
 
