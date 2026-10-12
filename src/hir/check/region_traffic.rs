@@ -311,31 +311,18 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// When `let` makes a view (`let r = g[1]`, `g.reshape(..)`, `h.t`, or an `if` or `match`
-    /// choosing one), the tensors it may be part of; empty when it makes no view. Only asked at
-    /// the region's top level: the scope of a nested block has ended by the time this walk
-    /// runs, so its binding's type is gone.
-    fn region_view_owners(&self, l: &LetDeclStmt, top_level: bool) -> Result<Vec<String>, String> {
-        if !top_level {
-            return Ok(Vec::new());
-        }
-        let ty = match &l.ty_ann {
-            Some(ann) => ann.clone(),
-            None => match self.lookup(l.name.as_ref()) {
-                Some((ty, _)) => ty.clone(),
-                None => return Ok(Vec::new()),
-            },
-        };
-        let Some(view) = self.view_of(&l.expr, &ty) else {
-            return Ok(Vec::new());
-        };
-        let mut owners: Vec<String> = view
-            .owners
-            .iter()
-            .map(|(name, _)| name.to_owned())
-            .collect();
+    /// choosing one), the tensors it may be part of; empty when it makes no view. Recorded by the
+    /// checker by the `let`'s position, since a nested block's scope is gone by this walk.
+    fn region_view_owners(&self, l: &LetDeclStmt) -> Vec<String> {
+        let mut owners = self
+            .borrow
+            .view_owners_by_let
+            .get(&l.span)
+            .cloned()
+            .unwrap_or_default();
         owners.sort();
         owners.dedup();
-        Ok(owners)
+        owners
     }
 
     /// The reads a view's own expression makes: its subscripts (`p[0]` in `g[p[0]]`), the
@@ -552,7 +539,7 @@ impl<'a> TypeChecker<'a> {
             match s {
                 Statement::LetDecl(l) => {
                     // Making a view loads nothing; only the reads in its subscripts count.
-                    let owners = self.region_view_owners(l, top_level)?;
+                    let owners = self.region_view_owners(l);
                     if !owners.is_empty() {
                         self.region_view_subscripts(&l.expr, mult, acc, exact, outer, binds)?;
                     } else {
@@ -572,8 +559,12 @@ impl<'a> TypeChecker<'a> {
                     // walk time and a name lookup could hit an OUTER same-name binding, so
                     // the honest verdict is Err -- uncountable, with a reason -- not a guess
                     // in either direction.
-                    let placed = self
-                        .region_binding_placed(&l.expr, outer, binds)
+                    //
+                    // A view is in its tensor's memory.
+                    let placed = owners
+                        .first()
+                        .and_then(|owner| self.region_placed(owner, outer, binds))
+                        .or_else(|| self.region_binding_placed(&l.expr, outer, binds))
                         .or_else(|| {
                             if !Self::init_can_carry_placement(&l.expr) {
                                 return None;

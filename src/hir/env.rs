@@ -1487,6 +1487,7 @@ impl<'a> TypeChecker<'a> {
         let prev_params = std::mem::take(&mut self.borrow.current_params);
         let prev_provenance = std::mem::take(&mut self.borrow.ref_provenance);
         let prev_views = std::mem::take(&mut self.borrow.views);
+        let prev_view_owners = std::mem::take(&mut self.borrow.view_owners_by_let);
         // The borrow table too. A function's body can be checked from inside another's: a
         // generic method is checked when a call first instantiates it. The caller's borrows are
         // not the callee's, and a parameter of the same name (`self` in both) would otherwise
@@ -1597,6 +1598,7 @@ impl<'a> TypeChecker<'a> {
         self.borrow.current_params = prev_params;
         self.borrow.ref_provenance = prev_provenance;
         self.borrow.views = prev_views;
+        self.borrow.view_owners_by_let = prev_view_owners;
         self.borrow.restore(prev_borrows);
         self.borrow.restore_borrowers(prev_borrowers);
         self.used_vars = prev_used_vars;

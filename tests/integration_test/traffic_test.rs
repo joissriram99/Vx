@@ -1383,3 +1383,64 @@ fn main() -> i32 {
         "one element written through `r`, into `ad` or `k`, so at most 4 bytes each:\n{region}"
     );
 }
+
+#[test]
+fn a_view_made_inside_a_loop_is_read_through_its_tensor() {
+    let region = view_region(
+        "view_made_in_loop",
+        "    for i in 0..2 {
+      let r = ad[i];
+      let x = r[0];
+    }",
+    );
+    assert!(
+        region.contains("\"traffic_exact\": true") && region.contains(&reads_only_ad(8)),
+        "one element of `ad` per trip, read through `r`; making `r` reads nothing:\n{region}"
+    );
+}
+
+// Inside the loop, `r` is one element of `ad`. The `r` outside the region is a whole tensor,
+// and must not make the element read look like a view.
+#[test]
+fn a_variable_outside_the_region_with_the_same_name_is_not_used() {
+    let src = "\
+Memory CPU_DRAM {}
+Memory GPU_HBM {
+  within: Memory::CPU_DRAM, capacity: 40 GiB, bandwidth: 3 TB/s
+}
+fn main() -> i32 {
+  let a = Tensor<f32, [2, 2]>::fill(1.0);
+  let ad = transfer(a, Memory::GPU_HBM);
+  let r = Tensor<f32, [2]>::fill(5.0);
+  spawn on(Topology::GPU) {
+    for i in 0..2 {
+      let r = ad[i][0];
+      let x = r + 1.0;
+    }
+  }
+  print(r[0]);
+  return 0;
+}
+";
+    let region = spawn_region(&record_source("view_same_name_outside", src), "main");
+    assert!(
+        region.contains("\"traffic_exact\": true") && region.contains(&reads_only_ad(8)),
+        "one element of `ad` read per trip:\n{region}"
+    );
+}
+
+#[test]
+fn a_view_chosen_inside_a_loop_is_charged_to_both() {
+    let region = two_tensor_region(
+        "view_chosen_in_loop",
+        "    let c = true;
+    for i in 0..2 {
+      let r = if c { ad[i] } else { k[i] };
+      let x = r[0];
+    }",
+    );
+    assert!(
+        region.contains("\"traffic_exact\": false") && region.contains(&reads_of_ad_and_k(8, 8)),
+        "one element per trip, from `ad` or `k`:\n{region}"
+    );
+}
