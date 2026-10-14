@@ -566,7 +566,9 @@ impl<'a> TypeChecker<'a> {
                         .and_then(|owner| self.region_placed(owner, outer, binds))
                         .or_else(|| self.region_binding_placed(&l.expr, outer, binds))
                         .or_else(|| {
-                            if !Self::init_can_carry_placement(&l.expr) {
+                            if !Self::init_can_carry_placement(crate::syntax::bare_unsafe_value(
+                                &l.expr,
+                            )) {
                                 return None;
                             }
                             // A type annotation settles it wherever the binding lives: an
